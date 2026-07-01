@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from itsdangerous import URLSafeSerializer, BadSignature
 
 # ============================================================ CONFIG
@@ -160,6 +160,8 @@ SCHEMA = [
         PRIMARY KEY(circle_id,user_id))""",
     """CREATE TABLE IF NOT EXISTS sync_log(user_id BIGINT, resource TEXT, finished_at REAL,
         records INTEGER, ok INTEGER, message TEXT)""",
+    """CREATE TABLE IF NOT EXISTS goals(user_id BIGINT, metric TEXT, target REAL, direction TEXT,
+        created_at REAL, PRIMARY KEY(user_id, metric))""",
 ]
 
 
@@ -1047,6 +1049,360 @@ def weekly_narrative(uid):
     return {"narrative": " ".join(L), "generated": str(date.today())}
 
 
+# ============================================================ DEEP ANALYTICS
+def _onset_min(iso):
+    if not iso:
+        return None
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return t.hour * 60 + t.minute
+    except ValueError:
+        return None
+
+
+def _linreg(xs, ys):
+    pts = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    if len(pts) < 4:
+        return None
+    n = len(pts)
+    sx = sum(p[0] for p in pts); sy = sum(p[1] for p in pts)
+    mx = sx / n; my = sy / n
+    var = sum((p[0] - mx) ** 2 for p in pts)
+    if var == 0:
+        return None
+    cov = sum((p[0] - mx) * (p[1] - my) for p in pts)
+    slope = cov / var
+    intercept = my - slope * mx
+    resid = [p[1] - (slope * p[0] + intercept) for p in pts]
+    rstd = statistics.pstdev(resid) if len(resid) > 1 else 0.0
+    return {"slope": slope, "intercept": intercept, "mean_x": mx, "mean_y": my, "rstd": rstd, "n": n}
+
+
+def _percentile(vals, v):
+    vals = [x for x in vals if x is not None]
+    if not vals or v is None:
+        return None
+    below = sum(1 for x in vals if x < v)
+    return round(below / len(vals) * 100)
+
+
+def feature_frame(uid):
+    recs = {r["day"]: r for r in _recs(uid)}
+    sleeps = {s["day"]: s for s in _sleeps(uid)}
+    cycles = {c["day"]: c for c in _cycles(uid)}
+    out = []
+    for d, r in recs.items():
+        try:
+            dd = datetime.fromisoformat(d).date()
+        except ValueError:
+            continue
+        prev = str(dd - timedelta(days=1))
+        s = sleeps.get(prev) or sleeps.get(d)
+        c = cycles.get(prev) or cycles.get(d)
+        out.append({
+            "day": d, "recovery": r.get("recovery_pct"), "hrv": r.get("hrv_rmssd_ms"),
+            "rhr": r.get("resting_hr"), "spo2": r.get("spo2_pct"), "skin_temp": r.get("skin_temp_c"),
+            "resp": s.get("respiratory_rate") if s else None,
+            "sleep_quality": s.get("quality") if s else None,
+            "sleep_hours": s.get("hours") if s else None,
+            "bedtime": _onset_min(s.get("start")) if s else None,
+            "strain": c.get("strain") if c else None,
+        })
+    out.sort(key=lambda x: x["day"])
+    return out
+
+
+METRIC_LABELS = {"recovery": "Recovery %", "hrv": "HRV (ms)", "rhr": "Resting HR",
+                 "sleep_quality": "Sleep quality", "sleep_hours": "Sleep hours",
+                 "strain": "Strain", "resp": "Respiratory rate", "bedtime": "Bedtime consistency"}
+HIGHER_BETTER = {"recovery": True, "hrv": True, "rhr": False, "sleep_quality": True,
+                 "sleep_hours": True, "strain": None, "resp": False, "bedtime": None}
+
+
+def driver_analysis(uid):
+    fr = feature_frame(uid)
+    rec = [r["recovery"] for r in fr]
+    drivers = []
+    for key in ("sleep_quality", "strain", "hrv", "rhr", "sleep_hours", "resp", "bedtime"):
+        xs = [r[key] for r in fr]
+        r = _pearson(xs, rec)
+        if r is not None:
+            drivers.append({"factor": METRIC_LABELS.get(key, key), "r": round(r, 2),
+                            "direction": "raises" if r > 0 else "lowers",
+                            "strength": "strong" if abs(r) >= .5 else "moderate" if abs(r) >= .3 else "weak"})
+    # journal habits from decision engine
+    dec = decision_report(uid)
+    for rt in dec.get("ratings", []):
+        if rt.get("recovery_delta") is not None and rt["n"] >= 3:
+            drivers.append({"factor": "habit: " + rt["tag"], "r": None,
+                            "direction": "raises" if rt["recovery_delta"] > 0 else "lowers",
+                            "strength": "n=" + str(rt["n"]), "delta": rt["recovery_delta"]})
+    drivers.sort(key=lambda d: abs(d["r"]) if d["r"] is not None else abs(d.get("delta", 0)) / 30, reverse=True)
+    return {"drivers": drivers, "target": "next-day recovery"}
+
+
+def why_day(uid):
+    fr = feature_frame(uid)
+    if not fr:
+        return {"has_data": False}
+    latest = fr[-1]
+    reasons = []
+    for key in ("sleep_quality", "strain", "hrv", "rhr", "resp", "sleep_hours"):
+        series = [r[key] for r in fr[:-1] if r[key] is not None]
+        v = latest.get(key)
+        if v is None or len(series) < 8:
+            continue
+        m = statistics.fmean(series); sd = statistics.pstdev(series) or 1e-9
+        z = (v - m) / sd
+        if abs(z) < 0.8:
+            continue
+        hb = HIGHER_BETTER.get(key)
+        good = (z > 0) if hb else (z < 0) if hb is False else None
+        verb = "high" if z > 0 else "low"
+        tag = "helped" if good else "hurt" if good is False else "notable"
+        reasons.append({"factor": METRIC_LABELS.get(key, key), "value": _round(v),
+                        "z": round(z, 1), "note": verb, "impact": tag})
+    j = one("SELECT tags_json FROM journal WHERE user_id=? AND day=?",
+            (uid, str((datetime.fromisoformat(latest['day']) - timedelta(days=1)).date())))
+    tags = json.loads(j["tags_json"]) if j and j.get("tags_json") else []
+    reasons.sort(key=lambda x: abs(x["z"]), reverse=True)
+    return {"has_data": True, "day": latest["day"], "recovery": _round(latest["recovery"]),
+            "reasons": reasons, "habits": tags}
+
+
+def trends(uid):
+    fr = feature_frame(uid)
+    out = []
+    for key in ("recovery", "hrv", "rhr", "sleep_quality", "sleep_hours", "strain"):
+        series = [(r["day"], r[key]) for r in fr if r[key] is not None]
+        vals = [v for _, v in series]
+        if len(vals) < 7:
+            continue
+
+        def avg(n):
+            w = vals[-n:]
+            return round(statistics.fmean(w), 1) if w else None
+
+        def window(a, b):
+            w = vals[a:b]
+            return statistics.fmean(w) if w else None
+        last7, prev7 = window(-7, None), window(-14, -7)
+        last30, prev30 = window(-30, None), window(-60, -30)
+        wow = round(last7 - prev7, 1) if (last7 is not None and prev7 is not None) else None
+        mom = round(last30 - prev30, 1) if (last30 is not None and prev30 is not None) else None
+        out.append({"metric": METRIC_LABELS[key], "key": key, "latest": round(vals[-1], 1),
+                    "avg7": avg(7), "avg30": avg(30), "avg90": avg(90),
+                    "wow": wow, "mom": mom, "percentile": _percentile(vals, vals[-1]),
+                    "higher_better": HIGHER_BETTER.get(key), "spark": [round(v, 1) for v in vals[-30:]]})
+    return {"metrics": out}
+
+
+def forecast(uid):
+    fr = [r for r in feature_frame(uid) if r["recovery"] is not None]
+    if len(fr) < 10:
+        return {"has_data": False}
+    # additive single-variable model: predicted = base + Σ slope_i*(x_today - mean_i)
+    base = statistics.fmean([r["recovery"] for r in fr])
+    latest = fr[-1]
+    contribs = []
+    pred = base
+    total_resid = 0.0
+    for key in ("sleep_quality", "strain", "hrv"):
+        xs = [r[key] for r in fr]; ys = [r["recovery"] for r in fr]
+        lr = _linreg(xs, ys)
+        xt = latest.get(key)
+        if lr and xt is not None:
+            delta = lr["slope"] * (xt - lr["mean_x"])
+            pred += delta
+            total_resid += lr["rstd"] ** 2
+            contribs.append({"factor": METRIC_LABELS[key], "effect": round(delta, 1)})
+    pred = max(1, min(99, round(pred)))
+    band = round((total_resid ** 0.5)) if total_resid else 8
+    ew = early_warning(uid)
+    return {"has_data": True, "predicted_recovery": pred, "range": [max(1, pred - band), min(99, pred + band)],
+            "contributors": contribs, "illness_risk": ew["level"], "illness_conf": ew["confidence"],
+            "note": "Estimated from how your recovery has historically responded to sleep, strain and HRV."}
+
+
+def workout_analysis(uid):
+    ws = rows("SELECT * FROM workouts WHERE user_id=? AND score_state=?", (uid, "SCORED"))
+    by_sport = defaultdict(lambda: {"count": 0, "strain": [], "avg_hr": [], "kj": 0.0, "dist": 0.0})
+    zones = [0, 0, 0, 0, 0, 0]
+    for w in ws:
+        sp = w.get("sport_name") or "workout"
+        b = by_sport[sp]
+        b["count"] += 1
+        if w.get("strain") is not None: b["strain"].append(w["strain"])
+        if w.get("avg_hr") is not None: b["avg_hr"].append(w["avg_hr"])
+        b["kj"] += w.get("kilojoules") or 0
+        b["dist"] += w.get("distance_m") or 0
+        try:
+            zs = _g(json.loads(w["raw_json"]), "score", "zone_durations") or {}
+            keys = ["zone_zero_milli", "zone_one_milli", "zone_two_milli", "zone_three_milli",
+                    "zone_four_milli", "zone_five_milli"]
+            for i, k in enumerate(keys):
+                zones[i] += zs.get(k) or 0
+        except Exception:
+            pass
+    sports = [{"sport": sp, "count": b["count"], "avg_strain": _round(_mean(b["strain"])),
+               "avg_hr": _round(_mean(b["avg_hr"])), "total_kj": round(b["kj"]),
+               "km": round(b["dist"] / 1000, 1)} for sp, b in by_sport.items()]
+    sports.sort(key=lambda s: s["count"], reverse=True)
+    ztot = sum(zones) or 1
+    zone_pct = [round(z / ztot * 100) for z in zones]
+    # Foster monotony & strain on daily cycle strain (last 7 days)
+    cyc = _cycles(uid)
+    today = date.today()
+    daily = [c["strain"] for c in cyc if c.get("strain") is not None
+             and _date(c["start"]) and (today - _date(c["start"])).days < 7]
+    monotony = strain_score = None
+    if len(daily) >= 3:
+        m = statistics.fmean(daily); sd = statistics.pstdev(daily) or 1e-9
+        monotony = round(m / sd, 2)
+        strain_score = round(sum(daily) * monotony)
+    return {"sports": sports, "zone_pct": zone_pct, "has_zones": sum(zones) > 0,
+            "monotony": monotony, "weekly_strain": strain_score,
+            "monotony_note": ("High monotony (>2) with high load raises overtraining risk — vary your days."
+                              if monotony and monotony > 2 else "Healthy training variation.")}
+
+
+def circadian(uid):
+    sl = [s for s in _sleeps(uid) if s.get("start") and s.get("end")][-60:]
+    pts = []
+    weekday_mid, weekend_mid = [], []
+    for s in sl:
+        on = _onset_min(s["start"]); wk = _onset_min(s["end"])
+        if on is None or wk is None:
+            continue
+        dur = (s.get("total_in_bed_ms") or 0) / 60000
+        mid = (on + dur / 2) % 1440
+        d = datetime.fromisoformat(s["start"].replace("Z", "+00:00"))
+        (weekend_mid if d.weekday() >= 5 else weekday_mid).append(mid)
+        pts.append({"day": s["day"], "onset": on, "wake": wk})
+    jetlag = None
+    if weekday_mid and weekend_mid:
+        jetlag = round(abs(statistics.fmean(weekend_mid) - statistics.fmean(weekday_mid)) / 60, 1)
+    return {"points": pts, "regularity": sleep_regularity(uid), "social_jetlag_h": jetlag,
+            "onset_std_min": round(statistics.pstdev([p["onset"] for p in pts])) if len(pts) > 2 else None}
+
+
+def anomalies(uid):
+    fr = feature_frame(uid)
+    events = []
+    for key in ("recovery", "hrv", "rhr", "resp", "skin_temp", "strain", "sleep_quality"):
+        series = [(r["day"], r[key]) for r in fr if r[key] is not None]
+        if len(series) < 15:
+            continue
+        vals = [v for _, v in series]
+        for i in range(10, len(series)):
+            base = vals[max(0, i - 30):i]
+            if len(base) < 8:
+                continue
+            m = statistics.fmean(base); sd = statistics.pstdev(base) or 1e-9
+            z = (vals[i] - m) / sd
+            if abs(z) >= 2.2:
+                events.append({"day": series[i][0], "metric": METRIC_LABELS.get(key, key),
+                               "z": round(z, 1), "value": round(vals[i], 1),
+                               "direction": "high" if z > 0 else "low"})
+    events.sort(key=lambda e: e["day"], reverse=True)
+    return {"events": events[:40]}
+
+
+def daily_frame_rows(uid):
+    return feature_frame(uid)
+
+
+def period_compare(uid, a_from, a_to, b_from, b_to):
+    fr = feature_frame(uid)
+
+    def stats_for(f, t):
+        sub = [r for r in fr if f <= r["day"] <= t]
+        out = {"n": len(sub)}
+        for key in ("recovery", "hrv", "rhr", "sleep_quality", "sleep_hours", "strain"):
+            out[key] = _round(_mean([r[key] for r in sub]))
+        return out
+    A, B = stats_for(a_from, a_to), stats_for(b_from, b_to)
+    deltas = {}
+    for key in ("recovery", "hrv", "rhr", "sleep_quality", "sleep_hours", "strain"):
+        if A.get(key) is not None and B.get(key) is not None:
+            deltas[key] = round(B[key] - A[key], 1)
+    return {"a": A, "b": B, "deltas": deltas, "labels": METRIC_LABELS}
+
+
+# ---- goals ----
+def set_goal(uid, metric, target, direction):
+    upsert("goals", {"user_id": uid, "metric": metric, "target": target,
+                     "direction": direction, "created_at": time.time()}, ["user_id", "metric"])
+
+
+def goals_status(uid):
+    gs = rows("SELECT * FROM goals WHERE user_id=?", (uid,))
+    fr = feature_frame(uid)[-30:]
+    out = []
+    for g in gs:
+        key = g["metric"]
+        vals = [r.get(key) for r in fr if r.get(key) is not None]
+        if not vals:
+            out.append({**g, "adherence": None, "recent": None}); continue
+        hit = sum(1 for v in vals if (v >= g["target"] if g["direction"] == "min" else v <= g["target"]))
+        out.append({"metric": key, "label": METRIC_LABELS.get(key, key), "target": g["target"],
+                    "direction": g["direction"], "adherence": round(hit / len(vals) * 100),
+                    "recent": _round(statistics.fmean(vals))})
+    return {"goals": out, "available": METRIC_LABELS}
+
+
+# ---- peptide correlations ----
+def peptide_correlations(uid):
+    recs = {r["day"]: r for r in _recs(uid)}
+    sleeps = {s["day"]: s for s in _sleeps(uid)}
+    peps = rows("SELECT * FROM peptides WHERE user_id=?", (uid,))
+    results = []
+    for p in peps:
+        taken = [x["day"] for x in rows(
+            "SELECT day FROM peptide_log WHERE user_id=? AND peptide_id=? AND taken=1 ORDER BY day ASC",
+            (uid, p["peptide_id"]))]
+        if not taken:
+            results.append({"name": p["name"], "status": "no doses logged yet"})
+            continue
+        taken_set = set(taken)
+        metrics = []
+        for label, src, key in (("Recovery %", recs, "recovery_pct"), ("HRV ms", recs, "hrv_rmssd_ms"),
+                                ("Sleep quality", sleeps, "quality"), ("Resting HR", recs, "resting_hr")):
+            on = [src[d][key] for d in src if d in taken_set and src[d].get(key) is not None]
+            off = [src[d][key] for d in src if d not in taken_set and src[d].get(key) is not None]
+            if len(on) >= 3 and len(off) >= 3:
+                mon, moff = statistics.fmean(on), statistics.fmean(off)
+                pooled = (statistics.pstdev(on) + statistics.pstdev(off)) / 2 or 1e-9
+                metrics.append({"label": label, "on": round(mon, 1), "off": round(moff, 1),
+                                "delta": round(mon - moff, 1), "effect": round((mon - moff) / pooled, 2),
+                                "n_on": len(on), "n_off": len(off)})
+        # weekly adherence vs weekly recovery correlation
+        wk_adh, wk_rec = {}, defaultdict(list)
+        days_sched = json.loads(p.get("days_json") or "[]")
+        for d, r in recs.items():
+            try:
+                monday = week_start(datetime.fromisoformat(d).date())
+            except ValueError:
+                continue
+            if r.get("recovery_pct") is not None:
+                wk_rec[monday].append(r["recovery_pct"])
+        for wk in wk_rec:
+            wd = datetime.fromisoformat(wk).date()
+            sched = len(days_sched) or 7
+            got = sum(1 for i in range(7) if str(wd + timedelta(days=i)) in taken_set)
+            wk_adh[wk] = got / sched * 100 if sched else 0
+        pairs_x, pairs_y = [], []
+        for wk in wk_rec:
+            pairs_x.append(wk_adh.get(wk, 0)); pairs_y.append(statistics.fmean(wk_rec[wk]))
+        adh_corr = _pearson(pairs_x, pairs_y)
+        conf = "low" if (not metrics or min((m["n_on"] for m in metrics), default=0) < 7) else "moderate"
+        results.append({"name": p["name"], "dose": p.get("dose"), "doses": len(taken),
+                        "metrics": metrics, "adherence_corr": _round(adh_corr, 2), "confidence": conf})
+    return {"peptides": results,
+            "disclaimer": "Personal within-subject tracking only — correlation is not causation, "
+                          "confounders exist, and small samples are noisy. Not medical advice."}
+
+
 # ============================================================ WEB APP
 app = FastAPI(title="WHOOP Circle")
 
@@ -1180,6 +1536,88 @@ def api_peptide_outcomes(request: Request):
 @app.get("/api/health/narrative")
 def api_narrative(request: Request):
     return weekly_narrative(require(request))
+
+
+@app.get("/api/insights/drivers")
+def api_drivers(request: Request):
+    return driver_analysis(require(request))
+
+
+@app.get("/api/insights/why")
+def api_why(request: Request):
+    return why_day(require(request))
+
+
+@app.get("/api/insights/trends")
+def api_trends(request: Request):
+    return trends(require(request))
+
+
+@app.get("/api/insights/forecast")
+def api_forecast(request: Request):
+    return forecast(require(request))
+
+
+@app.get("/api/insights/anomalies")
+def api_anomalies(request: Request):
+    return anomalies(require(request))
+
+
+@app.get("/api/workouts")
+def api_workouts(request: Request):
+    return workout_analysis(require(request))
+
+
+@app.get("/api/circadian")
+def api_circadian(request: Request):
+    return circadian(require(request))
+
+
+@app.get("/api/explore")
+def api_explore(request: Request):
+    return {"rows": daily_frame_rows(require(request)), "labels": METRIC_LABELS}
+
+
+@app.get("/api/explore/csv")
+def api_explore_csv(request: Request):
+    uid = require(request)
+    fr = daily_frame_rows(uid)
+    cols = ["day", "recovery", "hrv", "rhr", "spo2", "skin_temp", "resp",
+            "sleep_quality", "sleep_hours", "bedtime", "strain"]
+    lines = [",".join(cols)]
+    for r in fr:
+        lines.append(",".join("" if r.get(c) is None else str(r.get(c)) for c in cols))
+    return Response("\n".join(lines), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=whoop_circle_data.csv"})
+
+
+@app.get("/api/compare")
+def api_compare(request: Request, a_from: str, a_to: str, b_from: str, b_to: str):
+    return period_compare(require(request), a_from, a_to, b_from, b_to)
+
+
+@app.get("/api/goals")
+def api_goals(request: Request):
+    return goals_status(require(request))
+
+
+@app.post("/api/goals")
+async def api_goals_save(request: Request):
+    uid = require(request); b = await request.json()
+    set_goal(uid, b["metric"], float(b["target"]), b.get("direction", "min"))
+    return {"ok": True}
+
+
+@app.post("/api/goals/delete")
+async def api_goals_delete(request: Request):
+    uid = require(request); b = await request.json()
+    run("DELETE FROM goals WHERE user_id=? AND metric=?", (uid, b["metric"]))
+    return {"ok": True}
+
+
+@app.get("/api/peptides/correlations")
+def api_peptide_corr(request: Request):
+    return peptide_correlations(require(request))
 
 
 @app.get("/api/journal")
@@ -1355,73 +1793,78 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <title>WHOOP Circle</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-:root{--bg:#06080b;--bg2:#0b0f14;--panel:#0f151c;--panel2:#151d26;--line:#1e2732;--txt:#eaf1f8;--muted:#7d8b9a;--accent:#00e5a0;--accent2:#38bdf8;--red:#ff4d5e;--amber:#ffb020;--green:#16e0a3;--violet:#a78bfa}
+:root{--bg:#06080b;--bg2:#0b0f14;--panel:#0f151c;--panel2:#151d26;--line:#1e2732;--txt:#eaf1f8;--muted:#7d8b9a;--accent:#00e5a0;--accent2:#38bdf8;--red:#ff4d5e;--amber:#ffb020;--green:#16e0a3;--violet:#a78bfa;--pink:#f472b6}
 *{box-sizing:border-box}html,body{margin:0}
-body{background:radial-gradient(1200px 600px at 80% -10%,rgba(0,229,160,.06),transparent),var(--bg);color:var(--txt);font:15px/1.5 Inter,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+body{background:radial-gradient(1200px 600px at 82% -8%,rgba(0,229,160,.07),transparent),radial-gradient(900px 500px at 10% 110%,rgba(56,189,248,.05),transparent),var(--bg);color:var(--txt);font:15px/1.5 Inter,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 .app{display:flex;min-height:100vh}
-.side{width:230px;flex:0 0 230px;background:linear-gradient(180deg,var(--bg2),var(--bg));border-right:1px solid var(--line);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;padding:20px 14px}
-.brand{font-weight:800;letter-spacing:1px;font-size:16px;padding:6px 10px 18px}
-.brand b{color:var(--accent)}
-.nav{display:flex;flex-direction:column;gap:3px}
-.nav button{display:flex;align-items:center;gap:11px;background:none;border:none;color:var(--muted);text-align:left;padding:10px 12px;border-radius:10px;font-size:14.5px;font-weight:600;cursor:pointer;width:100%}
-.nav button .ic{width:18px;text-align:center;opacity:.9}
+.side{width:236px;flex:0 0 236px;background:linear-gradient(180deg,var(--bg2),var(--bg));border-right:1px solid var(--line);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;padding:18px 12px;overflow-y:auto}
+.brand{font-weight:800;letter-spacing:1px;font-size:16px;padding:6px 10px 14px}.brand b{color:var(--accent)}
+.nav{display:flex;flex-direction:column;gap:2px}
+.navgroup{font-size:10px;letter-spacing:1.4px;color:#55636f;font-weight:700;text-transform:uppercase;padding:14px 12px 5px}
+.nav button{display:flex;align-items:center;gap:11px;background:none;border:none;color:var(--muted);text-align:left;padding:9px 12px;border-radius:9px;font-size:14px;font-weight:600;cursor:pointer;width:100%}
+.nav button .ic{width:16px;text-align:center}
 .nav button:hover{background:var(--panel);color:var(--txt)}
 .nav button.active{background:linear-gradient(90deg,rgba(0,229,160,.16),rgba(0,229,160,.02));color:var(--txt);box-shadow:inset 2px 0 0 var(--accent)}
-.sidefoot{margin-top:auto;border-top:1px solid var(--line);padding-top:14px;font-size:13px;color:var(--muted)}
-.sidefoot .nm{color:var(--txt);font-weight:700;margin-bottom:8px}
-.main{flex:1;min-width:0;padding:26px 30px 60px}
-.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;gap:14px;flex-wrap:wrap}
-.topbar h2{margin:0;font-size:24px;font-weight:800;letter-spacing:-.3px}
-.pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:5px 13px;background:var(--panel)}
-button.b{cursor:pointer;border:none;border-radius:10px;padding:9px 15px;font-weight:700;font-size:13.5px}
+.sidefoot{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;font-size:13px;color:var(--muted)}
+.sidefoot .nm{color:var(--txt);font-weight:700;margin-bottom:8px;padding-left:2px}
+.main{flex:1;min-width:0;padding:24px 28px 60px}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;gap:14px;flex-wrap:wrap}
+.topbar h2{margin:0;font-size:23px;font-weight:800;letter-spacing:-.3px}
+.pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:5px 12px;background:var(--panel)}
+button.b{cursor:pointer;border:none;border-radius:9px;padding:9px 14px;font-weight:700;font-size:13px}
 .b.p{background:var(--accent);color:#04130b}.b.g{background:var(--panel2);color:var(--txt);border:1px solid var(--line)}
-.b.sm{padding:6px 11px;font-size:12.5px}.b.red{background:#3a1b22;color:#ff9aa6;border:1px solid #5a2730}
-.grid{display:grid;gap:16px}
-.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
-.cards{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
-@media(max-width:820px){.side{display:none}.g3,.g2{grid-template-columns:1fr}.main{padding:18px}}
-.panel{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:16px;padding:20px}
-.panel h3{margin:0 0 14px;font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700}
-.hero{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
-.big{font-size:52px;font-weight:800;line-height:1;letter-spacing:-1px}
-.lbl{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);font-weight:700}
-.tile .v{font-size:30px;font-weight:800;letter-spacing:-.5px;margin-top:2px}
-.tile .v small{font-size:13px;color:var(--muted);font-weight:600}
+.b.sm{padding:5px 10px;font-size:12px}.b.red{background:#3a1b22;color:#ff9aa6;border:1px solid #5a2730}
+.grid{display:grid;gap:15px}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
+.cards{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+@media(max-width:900px){.side{display:none}.g4,.g3,.g2{grid-template-columns:1fr}.main{padding:16px}}
+.panel{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:16px;padding:18px}
+.panel h3{margin:0 0 12px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700}
+.span2{grid-column:span 2}.span3{grid-column:span 3}
+.big{font-size:42px;font-weight:800;line-height:1;letter-spacing:-1px}
+.lbl{font-size:11px;text-transform:uppercase;letter-spacing:1.1px;color:var(--muted);font-weight:700}
+.v{font-size:28px;font-weight:800;letter-spacing:-.5px;margin-top:2px}.v small{font-size:13px;color:var(--muted);font-weight:600}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:middle;margin-right:6px}
-.d-optimal{background:var(--green)}.d-watch{background:var(--amber)}.d-flag{background:var(--red)}
-.chip{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 10px;margin:2px;font-size:12.5px}
+.d-optimal,.d-good{background:var(--green)}.d-watch{background:var(--amber)}.d-flag,.d-bad{background:var(--red)}
+.chip{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 10px;margin:2px;font-size:12px}
 .badge{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:4px 12px;margin:3px;font-size:13px}
-.banner{border-radius:14px;padding:16px 18px;border:1px solid var(--line);font-size:14.5px}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+tr.me td{background:rgba(0,229,160,.08)}
+.refbar{height:9px;border-radius:6px;background:var(--panel2);position:relative;margin-top:8px;overflow:hidden}
+.refband{position:absolute;top:0;bottom:0;background:rgba(0,229,160,.22)}.refmark{position:absolute;top:-3px;width:3px;height:15px;border-radius:2px;background:var(--txt)}
+.pctbar{height:7px;border-radius:5px;background:var(--panel2);overflow:hidden;margin-top:6px}.pctfill{height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent))}
+input,textarea,select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:9px;padding:8px 10px;font:inherit;width:100%}
+label{font-size:12px;color:var(--muted);display:block;margin:9px 0 4px}
+.row{display:flex;gap:10px;flex-wrap:wrap}.row>div{flex:1;min-width:120px}
+.muted{color:var(--muted)}.small{font-size:13px}.pos{color:var(--green)}.neg{color:var(--red)}
+.insight{background:var(--panel2);border-left:3px solid var(--accent2);padding:10px 13px;border-radius:6px;margin-bottom:8px;font-size:14px}
+.banner{border-radius:14px;padding:15px 17px;border:1px solid var(--line);font-size:14px}
 .ban-ok{background:linear-gradient(90deg,rgba(22,224,163,.12),transparent);border-color:rgba(22,224,163,.4)}
 .ban-watch{background:linear-gradient(90deg,rgba(255,176,32,.12),transparent);border-color:rgba(255,176,32,.4)}
 .ban-alert{background:linear-gradient(90deg,rgba(255,77,94,.14),transparent);border-color:rgba(255,77,94,.5)}
-table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
-th{color:var(--muted);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.6px}
-tr.me td{background:rgba(0,229,160,.08)}
-.refbar{height:10px;border-radius:6px;background:var(--panel2);position:relative;margin-top:8px;overflow:hidden}
-.refband{position:absolute;top:0;bottom:0;background:rgba(0,229,160,.22)}
-.refmark{position:absolute;top:-3px;width:3px;height:16px;border-radius:2px;background:var(--txt)}
-input,textarea,select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:9px;padding:9px 11px;font:inherit;width:100%}
-label{font-size:12px;color:var(--muted);display:block;margin:10px 0 4px}
-.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:130px}
-.muted{color:var(--muted)}.small{font-size:13px}.pos{color:var(--green)}.neg{color:var(--red)}
 .tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:2px 9px;margin:2px;font-size:12px;cursor:pointer}
 .tag.on{background:var(--accent);color:#04130b;border-color:var(--accent)}
 .hidden{display:none}.center{text-align:center;padding:80px 20px}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:s .8s linear infinite;vertical-align:middle}
 @keyframes s{to{transform:rotate(360deg)}}
-.pbox{width:32px;height:32px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px}
+.pbox{width:30px;height:30px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px}
 .pbox.on{background:var(--accent);color:#04130b;border-color:var(--accent)}.pbox.off{opacity:.3;cursor:default}
 .ccard{cursor:pointer}.ccard:hover{border-color:var(--accent)}
-.toggle{display:flex;align-items:center;gap:9px;margin:7px 0;font-size:14px}.toggle input{width:auto}
-.code{font-family:ui-monospace,Menlo,monospace;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:4px 9px}
-.rank{color:var(--muted);width:24px;display:inline-block}
+.toggle{display:flex;align-items:center;gap:8px;margin:6px 0;font-size:14px}.toggle input{width:auto}
+.code{font-family:ui-monospace,Menlo,monospace;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 9px}
+.rank{color:var(--muted);width:22px;display:inline-block}
 .reveal{animation:rv .4s ease}@keyframes rv{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
 a{color:var(--accent2)}
+.hm{display:flex;flex-direction:column;gap:2px}.hmrow{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)}
+.hmtrack{flex:1;height:11px;border-radius:4px;background:var(--panel2);position:relative}
+.hmbar{position:absolute;top:0;bottom:0;background:linear-gradient(90deg,var(--violet),var(--accent2));border-radius:4px;opacity:.85}
+.tl{border-left:2px solid var(--line);margin-left:6px;padding-left:14px}
+.tlrow{position:relative;padding:7px 0;font-size:13.5px}
+.tlrow:before{content:'';position:absolute;left:-21px;top:12px;width:9px;height:9px;border-radius:50%;background:var(--accent2)}
 </style></head><body>
 <div id="signin" class="center hidden">
 <div style="font-size:30px;font-weight:800;letter-spacing:1px">WHOOP <span style="color:var(--accent)">CIRCLE</span></div>
-<p class="muted" style="max-width:440px;margin:14px auto">Clinical-grade analytics on your WHOOP data — readiness, vitals early-warning, sleep medicine, training load, and a private peptide tracker. Compare with friends in invite-only circles.</p>
+<p class="muted" style="max-width:460px;margin:14px auto">Clinical-grade analytics on your WHOOP data — a full command center, deep insights, forecasting, a peptide tracker with correlations, and private friend circles.</p>
 <button class="b p" style="font-size:15px;padding:12px 22px" onclick="location.href='/login'">Sign in with WHOOP</button>
 <p class="muted small" id="credWarn"></p></div>
 
@@ -1429,13 +1872,20 @@ a{color:var(--accent2)}
 <aside class="side">
 <div class="brand">WHOOP <b>CIRCLE</b></div>
 <div class="nav" id="nav">
-<button data-tab="today" class="active" onclick="tab('today')"><span class="ic">◎</span> Today</button>
+<button data-tab="dashboard" class="active" onclick="tab('dashboard')"><span class="ic">◎</span> Dashboard</button>
+<div class="navgroup">Health</div>
 <button data-tab="vitals" onclick="tab('vitals')"><span class="ic">✦</span> Vitals</button>
 <button data-tab="sleep" onclick="tab('sleep')"><span class="ic">☾</span> Sleep</button>
-<button data-tab="load" onclick="tab('load')"><span class="ic">▲</span> Load</button>
+<button data-tab="load" onclick="tab('load')"><span class="ic">▲</span> Recovery &amp; Load</button>
+<div class="navgroup">Analysis</div>
+<button data-tab="insights" onclick="tab('insights')"><span class="ic">◈</span> Insights</button>
+<button data-tab="explore" onclick="tab('explore')"><span class="ic">⚡</span> Explore</button>
+<div class="navgroup">Track</div>
 <button data-tab="peptides" onclick="tab('peptides')"><span class="ic">⬡</span> Peptides</button>
 <button data-tab="journal" onclick="tab('journal')"><span class="ic">✎</span> Journal</button>
+<div class="navgroup">Social</div>
 <button data-tab="circles" onclick="tab('circles')"><span class="ic">◍</span> Circles</button>
+<div class="navgroup"></div>
 <button data-tab="report" onclick="tab('report')"><span class="ic">▤</span> Report</button>
 <button data-tab="settings" onclick="tab('settings')"><span class="ic">⚙</span> Settings</button>
 </div>
@@ -1444,74 +1894,110 @@ a{color:var(--accent2)}
 <div style="margin-top:10px;display:flex;gap:8px"><button class="b g sm" onclick="recentSync()">Sync</button><button class="b g sm" onclick="signOut()">Sign out</button></div></div>
 </aside>
 <main class="main">
-<div class="topbar"><h2 id="ttl">Today</h2><span class="muted small" id="asOf"></span></div>
+<div class="topbar"><h2 id="ttl">Dashboard</h2><span class="muted small" id="asOf"></span></div>
 
-<section id="tab-today">
-<div class="grid g3" style="align-items:stretch">
-<div class="panel" style="grid-column:span 1"><h3>Readiness</h3><div id="readRing" style="text-align:center"></div><div id="readRec" class="small muted" style="margin-top:8px;text-align:center"></div></div>
-<div class="panel" style="grid-column:span 2"><h3>Early-warning</h3><div id="ewBox"></div></div>
+<section id="tab-dashboard">
+<div class="grid g4">
+<div class="panel" style="grid-row:span 2;display:flex;flex-direction:column;align-items:center;justify-content:center"><h3 style="align-self:flex-start">Readiness</h3><div id="dRing"></div><div id="dRec" class="small muted" style="text-align:center;margin-top:8px"></div></div>
+<div class="panel span3"><h3>Early-warning</h3><div id="dEw"></div></div>
+<div class="panel"><h3>Load</h3><div id="dLoad"></div></div>
+<div class="panel"><h3>Sleep</h3><div id="dSleep"></div></div>
+<div class="panel"><h3>Latest</h3><div id="dLatest"></div></div>
 </div>
-<div class="panel" style="margin-top:16px"><h3>Vitals snapshot</h3><div class="grid cards" id="vitTiles"></div></div>
-<div class="grid g3" style="margin-top:16px">
-<div class="panel"><h3>Training load</h3><div id="loadMini"></div></div>
-<div class="panel"><h3>Sleep</h3><div id="sleepMini"></div></div>
-<div class="panel"><h3>Latest strain</h3><div id="strainMini"></div></div>
+<div class="panel" style="margin-top:15px"><h3>Vitals snapshot</h3><div class="grid cards" id="dVitals"></div></div>
+<div class="grid g2" style="margin-top:15px">
+<div class="panel"><h3>Recovery &amp; strain — last 30</h3><canvas id="dChart" height="130"></canvas></div>
+<div class="panel"><h3>Your weekly read-out</h3><div id="dNarr" class="reveal" style="font-size:15px;line-height:1.7"></div>
+<div id="dStreaks" style="margin-top:12px"></div></div>
 </div>
-<div class="panel" style="margin-top:16px"><h3>Your weekly read-out</h3><div id="narr" class="reveal"></div></div>
 </section>
 
 <section id="tab-vitals" class="hidden">
-<div class="panel" id="ewBox2" style="margin-bottom:16px"></div>
-<div class="grid g2" id="vitFull"></div>
-<p class="muted small" style="margin-top:12px">Each marker is compared to <b>your own</b> rolling baseline (shaded band = your typical range). z = standard deviations from your baseline; CV = day-to-day variability.</p>
+<div class="panel" id="vEw" style="margin-bottom:15px"></div>
+<div class="grid g2" id="vFull"></div>
+<p class="muted small" style="margin-top:10px">Each marker compares to <b>your own</b> rolling baseline (shaded band = typical range). z = SDs from baseline · CV = day-to-day variability.</p>
 </section>
 
 <section id="tab-sleep" class="hidden">
-<div class="grid g3">
-<div class="panel"><h3>Sleep regularity</h3><div id="sriBox" style="text-align:center"></div></div>
-<div class="panel"><h3>Sleep debt (7d)</h3><div id="debtBox"></div></div>
-<div class="panel"><h3>Avg duration</h3><div id="durBox"></div></div>
+<div class="grid g4">
+<div class="panel"><h3>Regularity</h3><div id="sSri" style="text-align:center"></div></div>
+<div class="panel"><h3>Sleep debt (7d)</h3><div id="sDebt"></div></div>
+<div class="panel"><h3>Avg duration</h3><div id="sDur"></div></div>
+<div class="panel"><h3>Social jetlag</h3><div id="sJet"></div></div>
 </div>
-<div class="grid g2" style="margin-top:16px">
-<div class="panel"><h3>Sleep architecture vs clinical norms</h3><div id="archBox"></div></div>
-<div class="panel"><h3>Breathing &amp; disruption</h3><div id="breatheBox"></div></div>
+<div class="grid g2" style="margin-top:15px">
+<div class="panel"><h3>Architecture vs clinical norms</h3><canvas id="sArch" height="150"></canvas><div id="sArchNote" class="small muted" style="margin-top:8px"></div></div>
+<div class="panel"><h3>Stage mix</h3><canvas id="sStage" height="150"></canvas></div>
 </div>
-<div class="panel" style="margin-top:16px"><h3>Sleep quality trend</h3><canvas id="sleepChart" height="90"></canvas></div>
+<div class="panel" style="margin-top:15px"><h3>Bedtime &amp; wake heatmap (last 30 nights)</h3><div id="sHeat"></div><div class="small muted" style="margin-top:6px">Each bar = time asleep across a 24h day (6pm → 6pm). Tight alignment = strong circadian rhythm.</div></div>
+<div class="panel" style="margin-top:15px"><h3>Sleep quality trend</h3><canvas id="sTrend" height="90"></canvas></div>
 </section>
 
 <section id="tab-load" class="hidden">
-<div class="grid g3">
-<div class="panel"><h3>ACWR</h3><div id="acwrBox" style="text-align:center"></div></div>
-<div class="panel"><h3>Acute load (7d)</h3><div id="acuteBox"></div></div>
-<div class="panel"><h3>Chronic load (28d)</h3><div id="chronicBox"></div></div>
+<div class="grid g4">
+<div class="panel"><h3>ACWR</h3><div id="lAcwr" style="text-align:center"></div></div>
+<div class="panel"><h3>Acute (7d)</h3><div id="lAcute"></div></div>
+<div class="panel"><h3>Chronic (28d)</h3><div id="lChronic"></div></div>
+<div class="panel"><h3>Monotony</h3><div id="lMono"></div></div>
 </div>
-<div class="panel" style="margin-top:16px"><h3>Strain &amp; workload ratio</h3><canvas id="loadChart" height="95"></canvas></div>
-<div class="panel" style="margin-top:16px"><h3>Recovery vs Strain</h3><canvas id="recChart" height="95"></canvas></div>
+<div class="panel" style="margin-top:15px"><h3>Strain &amp; workload ratio</h3><canvas id="lChart" height="95"></canvas></div>
+<div class="grid g2" style="margin-top:15px">
+<div class="panel"><h3>Recovery vs Strain</h3><canvas id="lRec" height="120"></canvas></div>
+<div class="panel"><h3>HR-zone distribution</h3><canvas id="lZones" height="120"></canvas></div>
+</div>
+<div class="panel" style="margin-top:15px"><h3>By sport</h3><canvas id="lSports" height="90"></canvas></div>
+</section>
+
+<section id="tab-insights" class="hidden">
+<div class="grid g2">
+<div class="panel"><h3>What drives your recovery</h3><canvas id="iDrivers" height="150"></canvas><div class="small muted" style="margin-top:6px">Correlation of each factor with next-day recovery (−1 to +1).</div></div>
+<div class="panel"><h3>Forecast — tomorrow's recovery</h3><div id="iForecast"></div></div>
+</div>
+<div class="panel" style="margin-top:15px"><h3>Why today looks the way it does</h3><div id="iWhy"></div></div>
+<div class="panel" style="margin-top:15px"><h3>Trends, deltas &amp; percentiles</h3><div class="grid cards" id="iTrends"></div></div>
+<div class="panel" style="margin-top:15px"><h3>Anomaly timeline</h3><div id="iAnom"></div></div>
+</section>
+
+<section id="tab-explore" class="hidden">
+<div class="panel"><h3>Interactive explorer</h3>
+<div class="row"><div><label>Metric A</label><select id="eA"></select></div><div><label>Metric B</label><select id="eB"></select></div>
+<div><label>Days</label><select id="eDays"><option value="30">30</option><option value="60">60</option><option value="90" selected>90</option><option value="9999">All</option></select></div>
+<div style="flex:0;display:flex;align-items:flex-end"><button class="b g sm" onclick="location.href='/api/explore/csv'">⭳ CSV</button></div></div>
+<canvas id="eChart" height="110" style="margin-top:12px"></canvas></div>
+<div class="grid g2" style="margin-top:15px">
+<div class="panel"><h3>Goals</h3><div id="gList"></div>
+<div class="row" style="margin-top:10px"><div><label>Metric</label><select id="gMetric"></select></div><div><label>Target</label><input id="gTarget" type="number" step="0.1"></div>
+<div><label>Direction</label><select id="gDir"><option value="min">at least</option><option value="max">at most</option></select></div>
+<div style="flex:0;display:flex;align-items:flex-end"><button class="b p sm" onclick="saveGoal()">Add</button></div></div></div>
+<div class="panel"><h3>Compare two periods</h3>
+<div class="row"><div><label>A from</label><input type="date" id="cAf"></div><div><label>A to</label><input type="date" id="cAt"></div></div>
+<div class="row"><div><label>B from</label><input type="date" id="cBf"></div><div><label>B to</label><input type="date" id="cBt"></div></div>
+<button class="b g sm" style="margin-top:10px" onclick="runCompare()">Compare</button>
+<canvas id="cChart" height="120" style="margin-top:12px"></canvas></div>
+</div>
 </section>
 
 <section id="tab-peptides" class="hidden">
 <div class="panel"><h3>Add a peptide</h3>
-<div class="row"><div><label>Name</label><input id="pName" placeholder="e.g. GHK-Cu"></div>
-<div><label>Dose (optional)</label><input id="pDose" placeholder="e.g. 2mg"></div></div>
+<div class="row"><div><label>Name</label><input id="pName" placeholder="e.g. GHK-Cu"></div><div><label>Dose</label><input id="pDose" placeholder="e.g. 2mg"></div></div>
 <label>Days of the week</label><div id="pDays"></div>
-<div style="margin-top:12px"><button class="b p" onclick="addPeptide()">Add peptide</button></div></div>
+<div style="margin-top:10px"><button class="b p" onclick="addPeptide()">Add peptide</button></div></div>
 <div class="panel"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
 <h3 style="margin:0">Week of <span id="pWeekLabel"></span></h3>
 <div><button class="b g sm" onclick="shiftWeek(-1)">‹ Prev</button> <button class="b g sm" onclick="shiftWeek(1)">Next ›</button></div></div>
 <div id="pGrid" style="overflow-x:auto"></div></div>
-<div class="panel"><h3>Outcome analytics — before vs during</h3>
-<p class="muted small" style="margin-top:-6px">Your averages in the ~3 weeks before your first logged dose vs during the cycle. Tracking only — not proof of effect, and not medical advice.</p>
-<div id="pOut"></div></div>
+<div class="panel"><h3>Outcomes — before vs during</h3><div id="pOut"></div></div>
+<div class="panel"><h3>Peptide ↔ health correlations</h3>
+<p class="muted small" style="margin-top:-6px" id="pCorrNote"></p><div id="pCorr"></div></div>
 </section>
 
 <section id="tab-journal" class="hidden">
 <div class="panel"><h3>Log a day</h3>
-<div class="row"><div><label>Date</label><input type="date" id="jDay"></div>
-<div><label>Mood (1–5)</label><input type="number" min="1" max="5" id="jMood" placeholder="optional"></div></div>
+<div class="row"><div><label>Date</label><input type="date" id="jDay"></div><div><label>Mood (1–5)</label><input type="number" min="1" max="5" id="jMood" placeholder="optional"></div></div>
 <label>Habits &amp; decisions</label><div id="tagBox"></div>
 <input id="jCustom" placeholder="add custom tag + Enter" style="margin-top:8px">
 <label>Notes</label><textarea id="jNotes" rows="2"></textarea>
-<div style="margin-top:12px"><button class="b p" onclick="saveJournal()">Save day</button> <span id="jMsg" class="muted"></span></div></div>
+<div style="margin-top:10px"><button class="b p" onclick="saveJournal()">Save day</button> <span id="jMsg" class="muted"></span></div></div>
 <div class="panel"><h3>Decision impact</h3><div id="decBaseline" class="muted small" style="margin-bottom:10px"></div><div id="decTable"></div></div>
 <div class="panel"><h3>Logged days</h3><div id="jList"></div></div>
 </section>
@@ -1519,24 +2005,21 @@ a{color:var(--accent2)}
 <section id="tab-circles" class="hidden">
 <div id="circlesList">
 <div class="panel"><div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-<button class="b p" onclick="createCircle()">+ Create circle</button>
-<button class="b g" onclick="joinCircle()">Join with code</button></div>
+<button class="b p" onclick="createCircle()">+ Create circle</button><button class="b g" onclick="joinCircle()">Join with code</button></div>
 <span class="muted small">Circles are private &amp; invite-only. You only see people inside a circle you share, and you approve every member.</span></div>
 <div id="circleCards" class="grid cards"></div></div>
 <div id="circleDetail" class="hidden"></div>
 </section>
 
 <section id="tab-report" class="hidden">
-<div class="panel"><h3>Health report</h3>
-<p class="muted">A clean, printable summary of your readiness, vitals, sleep, load and peptide analytics — save it as a PDF or share it.</p>
+<div class="panel"><h3>Health report</h3><p class="muted">A clean, printable summary of your readiness, vitals, sleep, load and peptide analytics.</p>
 <button class="b p" onclick="window.open('/report','_blank')">Open printable report</button></div>
 </section>
 
 <section id="tab-settings" class="hidden">
 <div class="panel"><h3>Display name</h3><p class="muted small">What friends see inside your circles.</p>
-<div class="row"><div><input id="setName"></div><div style="flex:0"><button class="b p" onclick="saveName()">Save</button></div></div>
-<span class="muted small" id="setMsg"></span></div>
-<div class="panel"><h3>About the analytics</h3><p class="muted small">Everything is computed against your own rolling baseline using personal z-scores, coefficient of variation, EWMA training load (ACWR), and published clinical/sports-science thresholds. This is informational, not medical advice — concerning patterns are worth discussing with a clinician.</p></div>
+<div class="row"><div><input id="setName"></div><div style="flex:0"><button class="b p" onclick="saveName()">Save</button></div></div><span class="muted small" id="setMsg"></span></div>
+<div class="panel"><h3>About the analytics</h3><p class="muted small">Everything is computed against your own rolling baseline using personal z-scores, EWMA training load (ACWR), and published clinical/sports-science thresholds. Informational only — not medical advice.</p></div>
 <div class="panel"><h3>Account</h3><button class="b red" onclick="signOut()">Sign out</button></div>
 </section>
 </main></div>
@@ -1544,97 +2027,120 @@ a{color:var(--accent2)}
 const $=s=>document.querySelector(s),api=(u,o)=>fetch(u,o).then(r=>r.json());
 const fmt=v=>(v===null||v===undefined||v==='')?'—':v;
 const DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-const TITLES={today:'Today',vitals:'Vitals',sleep:'Sleep',load:'Training Load',peptides:'Peptides',journal:'Journal',circles:'Circles',report:'Report',settings:'Settings'};
-let charts={},pWeek=null,me=null,curCircle=null;
-const zoneColor=z=>({optimal:'var(--green)',detraining:'var(--amber)',caution:'var(--amber)','high risk':'var(--red)',danger:'var(--red)'}[z]||'var(--muted)');
+const TITLES={dashboard:'Dashboard',vitals:'Vitals',sleep:'Sleep',load:'Recovery & Load',insights:'Insights',explore:'Explore',peptides:'Peptides',journal:'Journal',circles:'Circles',report:'Report',settings:'Settings'};
+let charts={},pWeek=null,me=null,curCircle=null,exploreRows=null;
 const bandColor=b=>({prime:'var(--green)',moderate:'var(--amber)',recover:'var(--red)'}[b]||'var(--muted)');
+const zoneColor=z=>({optimal:'var(--green)',detraining:'var(--amber)',caution:'var(--amber)','high risk':'var(--red)',danger:'var(--red)'}[z]||'var(--muted)');
 const stColor=s=>({optimal:'var(--green)',watch:'var(--amber)',flag:'var(--red)'}[s]||'var(--muted)');
 
-function spark(vals,color,w,h){w=w||120;h=h||30;const v=vals.filter(x=>x!=null);if(v.length<2)return'';
+function spark(vals,color,w,h){w=w||140;h=h||30;const v=vals.filter(x=>x!=null);if(v.length<2)return'';
  const mn=Math.min(...v),mx=Math.max(...v),rg=(mx-mn)||1;
  const pts=v.map((y,i)=>[(i/(v.length-1))*w,h-2-((y-mn)/rg)*(h-4)]);
- const d=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
- return'<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'"><path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="2" stroke-linejoin="round"/></svg>';}
-function ring(score,color,sub){score=score==null?0:score;const R=52,C=2*Math.PI*R,off=C*(1-score/100);
- return'<svg width="150" height="150" viewBox="0 0 150 150"><circle cx="75" cy="75" r="'+R+'" fill="none" stroke="var(--panel2)" stroke-width="12"/>'+
- '<circle cx="75" cy="75" r="'+R+'" fill="none" stroke="'+color+'" stroke-width="12" stroke-linecap="round" stroke-dasharray="'+C+'" stroke-dashoffset="'+off+'" transform="rotate(-90 75 75)"/>'+
- '<text x="75" y="72" text-anchor="middle" font-size="34" font-weight="800" fill="var(--txt)">'+(score==null?'—':score)+'</text>'+
- '<text x="75" y="94" text-anchor="middle" font-size="11" fill="var(--muted)" letter-spacing="1">'+(sub||'').toUpperCase()+'</text></svg>';}
-function refbar(low,high,latest,good){ // plot latest inside [low,high] band on a padded scale
- const pad=(high-low)||1;const min=low-pad,max=high+pad,rg=(max-min)||1;
- const bl=((low-min)/rg*100),bw=((high-low)/rg*100),mk=((latest-min)/rg*100);
- return'<div class="refbar"><div class="refband" style="left:'+bl+'%;width:'+bw+'%"></div><div class="refmark" style="left:'+Math.max(0,Math.min(100,mk))+'%"></div></div>';}
+ return'<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'"><path d="'+pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ')+'" fill="none" stroke="'+color+'" stroke-width="2" stroke-linejoin="round"/></svg>';}
+function ring(score,color,sub,size){size=size||150;const R=size/2-13,C=2*Math.PI*R,off=C*(1-(score==null?0:score)/100);const c=size/2;
+ return'<svg width="'+size+'" height="'+size+'" viewBox="0 0 '+size+' '+size+'"><circle cx="'+c+'" cy="'+c+'" r="'+R+'" fill="none" stroke="var(--panel2)" stroke-width="12"/>'+
+ '<circle cx="'+c+'" cy="'+c+'" r="'+R+'" fill="none" stroke="'+color+'" stroke-width="12" stroke-linecap="round" stroke-dasharray="'+C+'" stroke-dashoffset="'+off+'" transform="rotate(-90 '+c+' '+c+')"/>'+
+ '<text x="'+c+'" y="'+(c-3)+'" text-anchor="middle" font-size="'+(size/4.2)+'" font-weight="800" fill="var(--txt)">'+(score==null?'—':score)+'</text>'+
+ '<text x="'+c+'" y="'+(c+18)+'" text-anchor="middle" font-size="11" fill="var(--muted)" letter-spacing="1">'+(sub||'').toUpperCase()+'</text></svg>';}
+function refbar(low,high,latest){const pad=(high-low)||1,min=low-pad,max=high+pad,rg=(max-min)||1;
+ return'<div class="refbar"><div class="refband" style="left:'+((low-min)/rg*100)+'%;width:'+((high-low)/rg*100)+'%"></div><div class="refmark" style="left:'+Math.max(0,Math.min(100,(latest-min)/rg*100))+'%"></div></div>';}
+function pctbar(p){return'<div class="pctbar"><div class="pctfill" style="width:'+(p||0)+'%"></div></div>';}
 
 async function boot(){const m=await api('/api/me');me=m;
  if(!m.signed_in){$('#signin').classList.remove('hidden');if(!m.has_credentials)$('#credWarn').innerHTML='⚠️ Server has no WHOOP credentials configured yet.';return;}
  $('#app').classList.remove('hidden');$('#sideName').textContent=m.name;$('#jDay').value=new Date().toISOString().slice(0,10);
- renderTagBox();renderDayPicker();pWeek=mondayOf(new Date());pollSync();loadToday();}
+ renderTagBox();renderDayPicker();pWeek=mondayOf(new Date());initExploreControls();pollSync();loadDashboard();}
 function setStatus(t){$('#statusPill').innerHTML=t;}
 async function pollSync(){const s=await api('/api/sync/status');const c=s.counts||{};const n=Object.values(c).reduce((a,b)=>a+b,0);
  if(s.running){setStatus('<span class="spin"></span> syncing '+n);setTimeout(pollSync,1600);}else{setStatus('● up to date');refreshActive();}}
 async function recentSync(){setStatus('<span class="spin"></span> syncing…');await fetch('/api/sync/recent',{method:'POST'});pollSync();}
 async function signOut(){await fetch('/api/logout',{method:'POST'});location.href='/';}
-let active='today';
+let active='dashboard';
 function tab(name){active=name;document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));
- document.querySelectorAll('main section').forEach(s=>s.classList.add('hidden'));$('#tab-'+name).classList.remove('hidden');
- $('#ttl').textContent=TITLES[name];refreshActive();}
-function refreshActive(){({today:loadToday,vitals:loadVitals,sleep:loadSleep,load:loadLoad,peptides:loadPeptides,journal:loadJournal,circles:loadCircles,settings:loadSettings}[active]||(()=>{}))();}
+ document.querySelectorAll('main section').forEach(s=>s.classList.add('hidden'));$('#tab-'+name).classList.remove('hidden');$('#ttl').textContent=TITLES[name];refreshActive();}
+function refreshActive(){({dashboard:loadDashboard,vitals:loadVitals,sleep:loadSleep,load:loadLoad,insights:loadInsights,explore:loadExplore,peptides:loadPeptides,journal:loadJournal,circles:loadCircles,settings:loadSettings}[active]||(()=>{}))();}
+function ewHtml(ew){const cls={ok:'ban-ok',watch:'ban-watch',alert:'ban-alert'}[ew.level],ic={ok:'✅',watch:'⚠️',alert:'🚨'}[ew.level];
+ let h='<div class="banner '+cls+'"><div style="font-size:15px;font-weight:700;margin-bottom:5px">'+ic+' '+ew.level.toUpperCase()+' · '+ew.confidence+'% confidence</div>'+ew.message;
+ if(ew.drivers&&ew.drivers.length)h+='<div style="margin-top:8px">'+ew.drivers.map(d=>'<span class="chip">'+d+'</span>').join('')+'</div>';return h+'</div>';}
+function vitTile(v){return'<div class="panel" style="padding:14px"><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v">'+v.latest+' <small>'+v.unit+'</small></div><div style="margin-top:6px">'+spark(v.trend,stColor(v.status),150,26)+'</div><div class="muted small" style="margin-top:3px">z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · cv '+v.cv+'%':'')+'</div></div>';}
 
-/* ---------- TODAY ---------- */
-async function loadToday(){
- const[rd,ew,vp,ld,sm,ov,nar]=await Promise.all([api('/api/health/readiness'),api('/api/health/early-warning'),api('/api/health/vitals'),api('/api/health/load'),api('/api/health/sleepmed'),api('/api/overview'),api('/api/health/narrative')]);
- $('#readRing').innerHTML=ring(rd.score,bandColor(rd.band),rd.band||'');
- $('#readRec').textContent=rd.recommendation||'';
- $('#ewBox').innerHTML=ewHtml(ew);
- $('#vitTiles').innerHTML=vp.vitals.map(vitTile).join('');
- $('#loadMini').innerHTML=ld.enough?('<div class="big" style="color:'+zoneColor(ld.zone)+'">'+ld.acwr+'</div><div class="lbl">ACWR · '+ld.zone+'</div><div class="muted small" style="margin-top:6px">acute '+ld.acute+' / chronic '+ld.chronic+'</div>'):'<span class="muted">Need 2+ weeks of data.</span>';
- $('#sleepMini').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">avg duration</div><div class="muted small" style="margin-top:6px">'+ (sm.debt_h!=null?sm.debt_h+'h debt · ':'') + (sm.regularity!=null?'regularity '+sm.regularity:'') +'</div>';
- const L=ov.latest;$('#strainMini').innerHTML='<div class="big">'+fmt(L.strain)+'</div><div class="lbl">latest strain</div><div class="muted small" style="margin-top:6px">recovery '+fmt(L.recovery_pct)+'% · sleep '+fmt(L.sleep_quality)+'</div>';
- $('#narr').innerHTML='<div style="font-size:15.5px;line-height:1.7">'+nar.narrative+'</div>';
- $('#asOf').textContent='';
-}
-function ewHtml(ew){const cls={ok:'ban-ok',watch:'ban-watch',alert:'ban-alert'}[ew.level];
- const ic={ok:'✅',watch:'⚠️',alert:'🚨'}[ew.level];
- let h='<div class="banner '+cls+'"><div style="font-size:16px;font-weight:700;margin-bottom:6px">'+ic+' '+ew.level.toUpperCase()+' · '+ew.confidence+'% confidence</div>'+ew.message;
- if(ew.drivers&&ew.drivers.length)h+='<div style="margin-top:10px">'+ew.drivers.map(d=>'<span class="chip">'+d+'</span>').join('')+'</div>';
- h+='</div>';return h;}
-function vitTile(v){return'<div class="tile panel" style="padding:15px"><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div>'+
- '<div class="v">'+v.latest+' <small>'+v.unit+'</small></div>'+
- '<div style="margin-top:6px">'+spark(v.trend,stColor(v.status),140,26)+'</div>'+
- '<div class="muted small" style="margin-top:4px">z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · cv '+v.cv+'%':'')+'</div></div>';}
+/* ---------- DASHBOARD ---------- */
+async function loadDashboard(){
+ const[rd,ew,vp,ld,sm,ov,nar,rc]=await Promise.all([api('/api/health/readiness'),api('/api/health/early-warning'),api('/api/health/vitals'),api('/api/health/load'),api('/api/health/sleepmed'),api('/api/overview'),api('/api/health/narrative'),api('/api/recovery')]);
+ $('#dRing').innerHTML=ring(rd.score,bandColor(rd.band),rd.band||'',160);$('#dRec').textContent=rd.recommendation||'';
+ $('#dEw').innerHTML=ewHtml(ew);
+ $('#dLoad').innerHTML=ld.enough?'<div class="big" style="color:'+zoneColor(ld.zone)+'">'+ld.acwr+'</div><div class="lbl">ACWR · '+ld.zone+'</div><div class="muted small" style="margin-top:6px">acute '+ld.acute+' / chronic '+ld.chronic+'</div>':'<span class="muted small">Need 2+ weeks.</span>';
+ $('#dSleep').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:16px" class="muted">h</small></div><div class="lbl">avg sleep</div><div class="muted small" style="margin-top:6px">'+(sm.debt_h!=null?sm.debt_h+'h debt · ':'')+(sm.regularity!=null?'SRI '+sm.regularity:'')+'</div>';
+ const L=ov.latest;$('#dLatest').innerHTML='<div class="big">'+fmt(L.recovery_pct)+'<small style="font-size:16px" class="muted">%</small></div><div class="lbl">recovery</div><div class="muted small" style="margin-top:6px">strain '+fmt(L.strain)+' · sleep '+fmt(L.sleep_quality)+'</div>';
+ $('#dVitals').innerHTML=vp.vitals.map(vitTile).join('');
+ const s=rc.series.slice(-30),labels=s.map(p=>p.day);
+ mkChart('dChart','line',{labels,datasets:[{label:'Recovery %',data:s.map(p=>p.recovery),borderColor:'#16e0a3',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Strain',data:s.map(p=>p.strain),borderColor:'#ff8a3a',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:100},y1:{position:'right',min:0,max:21,grid:{drawOnChartArea:false}}}});
+ $('#dNarr').innerHTML=nar.narrative;}
 
 /* ---------- VITALS ---------- */
 async function loadVitals(){const[vp,ew]=await Promise.all([api('/api/health/vitals'),api('/api/health/early-warning')]);
- $('#ewBox2').innerHTML='<h3>Early-warning</h3>'+ewHtml(ew);
- $('#vitFull').innerHTML=vp.vitals.map(v=>'<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline">'+
- '<div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:34px;font-weight:800">'+v.latest+' <small class="muted" style="font-size:14px">'+v.unit+'</small></div></div>'+
- '<div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+
- refbar(v.low,v.high,v.latest,v.higher_better)+
- '<div class="muted small" style="margin-top:8px">your range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · variability '+v.cv+'%':'')+(v.popref?' · typical '+v.popref:'')+'</div></div>').join('');}
+ $('#vEw').innerHTML='<h3>Early-warning</h3>'+ewHtml(ew);
+ $('#vFull').innerHTML=vp.vitals.map((v,i)=>'<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div class="muted small" style="margin-top:8px">range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+(v.popref?' · typical '+v.popref:'')+'</div></div>').join('');}
 
 /* ---------- SLEEP ---------- */
-async function loadSleep(){const[sm,sr]=await Promise.all([api('/api/health/sleepmed'),api('/api/sleep')]);
+async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/sleepmed'),api('/api/sleep'),api('/api/circadian')]);
  if(sm.enough){
-  $('#sriBox').innerHTML=ring(sm.regularity,sm.regularity>=85?'var(--green)':sm.regularity>=70?'var(--amber)':'var(--red)','SRI');
-  $('#debtBox').innerHTML='<div class="big" style="color:'+(sm.debt_h>=6?'var(--red)':sm.debt_h>=3?'var(--amber)':'var(--green)')+'">'+fmt(sm.debt_h)+'<small style="font-size:20px" class="muted">h</small></div><div class="lbl">last 7 nights</div>';
-  $('#durBox').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:20px" class="muted">h</small></div><div class="lbl">avg / night</div>';
-  $('#archBox').innerHTML='<table><tr><th>Stage</th><th>You</th><th>Norm</th><th></th></tr>'+sm.architecture.map(a=>'<tr><td>'+a.stage+'</td><td>'+a.pct+'%</td><td class="muted">'+a.norm+'</td><td><span class="dot d-'+a.status+'"></span>'+a.status+'</td></tr>').join('')+'</table>';
-  $('#breatheBox').innerHTML='<div class="row"><div><div class="lbl">Avg SpO₂</div><div class="v" style="font-size:26px;font-weight:800">'+fmt(sm.spo2)+'%</div></div><div><div class="lbl">Resp rate</div><div class="v" style="font-size:26px;font-weight:800">'+fmt(sm.respiratory_rate)+'</div></div><div><div class="lbl">Disturbances</div><div class="v" style="font-size:26px;font-weight:800">'+fmt(sm.disturbances)+'</div></div></div>'+(sm.breathing_flags.length?sm.breathing_flags.map(f=>'<div class="banner ban-watch small" style="margin-top:10px">⚠️ '+f+'</div>').join(''):'<div class="muted small" style="margin-top:10px">No breathing flags.</div>');
- } else {$('#archBox').innerHTML='<span class="muted">Need more sleep data.</span>';}
+  $('#sSri').innerHTML=ring(sm.regularity,sm.regularity>=85?'var(--green)':sm.regularity>=70?'var(--amber)':'var(--red)','SRI',130);
+  $('#sDebt').innerHTML='<div class="big" style="color:'+(sm.debt_h>=6?'var(--red)':sm.debt_h>=3?'var(--amber)':'var(--green)')+'">'+fmt(sm.debt_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">last 7 nights</div>';
+  $('#sDur').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">per night</div>';
+  $('#sJet').innerHTML='<div class="big">'+fmt(cir.social_jetlag_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">weekend shift</div>';
+  const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stColor(x.status))},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
+  $('#sArchNote').innerHTML=a.map(x=>x.stage+' '+x.pct+'% ('+x.norm+') <span class="dot d-'+x.status+'"></span>').join(' &nbsp; ');
+  mkChart('sStage','doughnut',{labels:['Light','REM','Deep'],datasets:[{data:[a.find(x=>x.stage=='Light').pct,a.find(x=>x.stage=='REM').pct,a.find(x=>x.stage=='Deep').pct],backgroundColor:['#38bdf8','#a78bfa','#00e5a0']}]},{plugins:{legend:{position:'bottom'}}});
+  // heatmap
+  const pts=cir.points.slice(-30);
+  $('#sHeat').innerHTML='<div class="hm">'+pts.map(p=>{let a1=(p.onset-1080+1440)%1440,a2=(p.wake-1080+1440)%1440;let L=a1/1440*100,W=((a2-a1+1440)%1440)/1440*100;return'<div class="hmrow"><span style="width:64px">'+p.day.slice(5)+'</span><div class="hmtrack"><div class="hmbar" style="left:'+L+'%;width:'+W+'%"></div></div></div>';}).join('')+'</div>';
+ } else {$('#sSri').innerHTML='<span class="muted">Need more sleep data.</span>';}
  const labels=sr.series.map(p=>p.day);
- mkChart('sleepChart','line',{labels,datasets:[{label:'Quality',data:sr.series.map(p=>p.quality),borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.12)',tension:.3,pointRadius:0,fill:true},{label:'7-night avg',data:sr.series.map(p=>p.rolling7),borderColor:'#00e5a0',borderWidth:2,pointRadius:0,tension:.3}]},{scales:{y:{min:0,max:100}}});}
+ mkChart('sTrend','line',{labels,datasets:[{label:'Quality',data:sr.series.map(p=>p.quality),borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.12)',tension:.3,pointRadius:0,fill:true},{label:'7-night avg',data:sr.series.map(p=>p.rolling7),borderColor:'#00e5a0',borderWidth:2,pointRadius:0,tension:.3}]},{scales:{y:{min:0,max:100}}});}
 
 /* ---------- LOAD ---------- */
-async function loadLoad(){const[ld,rc]=await Promise.all([api('/api/health/load'),api('/api/recovery')]);
+async function loadLoad(){const[ld,rc,wo]=await Promise.all([api('/api/health/load'),api('/api/recovery'),api('/api/workouts')]);
  if(ld.enough){
-  $('#acwrBox').innerHTML=ring(Math.min(100,Math.round(ld.acwr/2*100)),zoneColor(ld.zone),ld.zone)+'<div class="big" style="font-size:30px;margin-top:-6px;color:'+zoneColor(ld.zone)+'">'+ld.acwr+'</div>';
-  $('#acuteBox').innerHTML='<div class="big">'+ld.acute+'</div><div class="lbl">7-day EWMA strain</div>';
-  $('#chronicBox').innerHTML='<div class="big">'+ld.chronic+'</div><div class="lbl">28-day EWMA strain</div>';
+  $('#lAcwr').innerHTML=ring(Math.min(100,Math.round(ld.acwr/2*100)),zoneColor(ld.zone),ld.zone,130);
+  $('#lAcute').innerHTML='<div class="big">'+ld.acute+'</div><div class="lbl">7d EWMA strain</div>';
+  $('#lChronic').innerHTML='<div class="big">'+ld.chronic+'</div><div class="lbl">28d EWMA strain</div>';
   const labels=ld.series.map(p=>p.day);
-  mkChart('loadChart','line',{labels,datasets:[{type:'bar',label:'Daily strain',data:ld.series.map(p=>p.strain),backgroundColor:'rgba(56,189,248,.35)',yAxisID:'y'},{label:'ACWR',data:ld.series.map(p=>p.acwr),borderColor:'#ffb020',borderWidth:2,pointRadius:0,tension:.3,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:21},y1:{position:'right',min:0,max:2.5,grid:{drawOnChartArea:false}}}});
- } else {$('#acwrBox').innerHTML='<span class="muted">Need 2+ weeks of data.</span>';}
- const labels=rc.series.map(p=>p.day);
- mkChart('recChart','line',{labels,datasets:[{label:'Recovery %',data:rc.series.map(p=>p.recovery),borderColor:'#16e0a3',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Strain',data:rc.series.map(p=>p.strain),borderColor:'#ff8a3a',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:100},y1:{position:'right',min:0,max:21,grid:{drawOnChartArea:false}}}});}
+  mkChart('lChart','line',{labels,datasets:[{type:'bar',label:'Daily strain',data:ld.series.map(p=>p.strain),backgroundColor:'rgba(56,189,248,.35)',yAxisID:'y'},{label:'ACWR',data:ld.series.map(p=>p.acwr),borderColor:'#ffb020',borderWidth:2,pointRadius:0,tension:.3,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:21},y1:{position:'right',min:0,max:2.5,grid:{drawOnChartArea:false}}}});
+ } else {$('#lAcwr').innerHTML='<span class="muted small">Need 2+ weeks.</span>';}
+ $('#lMono').innerHTML=wo.monotony!=null?'<div class="big" style="color:'+(wo.monotony>2?'var(--red)':'var(--green)')+'">'+wo.monotony+'</div><div class="lbl">weekly strain '+fmt(wo.weekly_strain)+'</div><div class="muted small" style="margin-top:5px">'+wo.monotony_note+'</div>':'<span class="muted small">Need recent data.</span>';
+ const s=rc.series.slice(-90),labels=s.map(p=>p.day);
+ mkChart('lRec','line',{labels,datasets:[{label:'Recovery %',data:s.map(p=>p.recovery),borderColor:'#16e0a3',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Strain',data:s.map(p=>p.strain),borderColor:'#ff8a3a',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:100},y1:{position:'right',min:0,max:21,grid:{drawOnChartArea:false}}}});
+ if(wo.has_zones)mkChart('lZones','polarArea',{labels:['Z0','Z1','Z2','Z3','Z4','Z5'],datasets:[{data:wo.zone_pct,backgroundColor:['#334155','#38bdf8','#00e5a0','#ffb020','#ff8a3a','#ff4d5e']}]},{plugins:{legend:{position:'right'}}});
+ else $('#lZones').parentElement.querySelector('canvas').replaceWith(Object.assign(document.createElement('div'),{className:'muted small',textContent:'No HR-zone data.'}));
+ mkChart('lSports','bar',{labels:wo.sports.map(s=>s.sport),datasets:[{label:'Sessions',data:wo.sports.map(s=>s.count),backgroundColor:'#38bdf8'},{label:'Avg strain',data:wo.sports.map(s=>s.avg_strain),backgroundColor:'#00e5a0'}]});}
+
+/* ---------- INSIGHTS ---------- */
+async function loadInsights(){const[dr,fc,wy,tr,an]=await Promise.all([api('/api/insights/drivers'),api('/api/insights/forecast'),api('/api/insights/why'),api('/api/insights/trends'),api('/api/insights/anomalies')]);
+ const d=dr.drivers.filter(x=>x.r!=null).slice(0,7);
+ mkChart('iDrivers','bar',{labels:d.map(x=>x.factor),datasets:[{label:'Correlation with recovery',data:d.map(x=>x.r),backgroundColor:d.map(x=>x.r>0?'#00e5a0':'#ff4d5e')}]},{indexAxis:'y',scales:{x:{min:-1,max:1}}});
+ if(fc.has_data){$('#iForecast').innerHTML='<div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap"><div style="text-align:center">'+ring(fc.predicted_recovery,bandColor(fc.predicted_recovery>=67?'prime':fc.predicted_recovery>=34?'moderate':'recover'),'pred',130)+'<div class="muted small">likely '+fc.range[0]+'–'+fc.range[1]+'%</div></div><div style="flex:1"><div class="lbl">Contributors</div>'+fc.contributors.map(c=>'<div style="margin:4px 0">'+c.factor+' <b class="'+(c.effect>0?'pos':'neg')+'">'+(c.effect>0?'+':'')+c.effect+'</b></div>').join('')+'<div class="muted small" style="margin-top:8px">Illness risk: '+fc.illness_risk+' ('+fc.illness_conf+'%)</div></div></div><div class="muted small" style="margin-top:8px">'+fc.note+'</div>';}
+ else $('#iForecast').innerHTML='<span class="muted">Need more history to forecast.</span>';
+ if(wy.has_data){$('#iWhy').innerHTML='<div class="muted small" style="margin-bottom:8px">'+wy.day+' · recovery '+fmt(wy.recovery)+'%'+(wy.habits.length?' · logged: '+wy.habits.join(', '):'')+'</div>'+(wy.reasons.length?wy.reasons.map(r=>'<div class="insight" style="border-left-color:'+(r.impact=='helped'?'var(--green)':r.impact=='hurt'?'var(--red)':'var(--accent2)')+'">'+r.factor+' was <b>'+r.note+'</b> ('+(r.z>0?'+':'')+r.z+' SD) — '+r.impact+'</div>').join(''):'<span class="muted">Everything near your baseline today.</span>');}
+ else $('#iWhy').innerHTML='<span class="muted">Need more data.</span>';
+ $('#iTrends').innerHTML=tr.metrics.map(m=>{const good=m.higher_better;const wc=m.wow==null?'':(m.wow>0)===(good!==false)?'pos':'neg';const mc=m.mom==null?'':(m.mom>0)===(good!==false)?'pos':'neg';
+  return'<div class="panel" style="padding:14px"><div class="lbl">'+m.metric+'</div><div class="v" style="font-size:24px">'+m.latest+'</div><div style="margin:4px 0">'+spark(m.spark,'#38bdf8',150,26)+'</div><div class="small muted">7d '+m.avg7+' · 30d '+m.avg30+'</div><div class="small">WoW <b class="'+wc+'">'+(m.wow>0?'+':'')+fmt(m.wow)+'</b> · MoM <b class="'+mc+'">'+(m.mom>0?'+':'')+fmt(m.mom)+'</b></div><div class="small muted" style="margin-top:4px">percentile '+m.percentile+'</div>'+pctbar(m.percentile)+'</div>';}).join('');
+ $('#iAnom').innerHTML=an.events.length?'<div class="tl">'+an.events.map(e=>'<div class="tlrow"><b>'+e.day+'</b> — '+e.metric+' unusually <b class="'+(e.direction=='high'?'pos':'neg')+'">'+e.direction+'</b> ('+(e.z>0?'+':'')+e.z+' SD, '+e.value+')</div>').join('')+'</div>':'<span class="muted">No anomalies detected.</span>';}
+
+/* ---------- EXPLORE ---------- */
+function initExploreControls(){}
+async function loadExplore(){const[ex,gl]=await Promise.all([api('/api/explore'),api('/api/goals')]);exploreRows=ex.rows;
+ const opts=Object.entries(ex.labels).map(([k,l])=>'<option value="'+k+'">'+l+'</option>').join('');
+ if(!$('#eA').options.length){$('#eA').innerHTML=opts;$('#eB').innerHTML=opts;$('#eA').value='recovery';$('#eB').value='hrv';$('#eA').onchange=drawExplore;$('#eB').onchange=drawExplore;$('#eDays').onchange=drawExplore;
+  $('#gMetric').innerHTML=Object.entries(gl.available).map(([k,l])=>'<option value="'+k+'">'+l+'</option>').join('');}
+ drawExplore();renderGoals(gl);}
+function drawExplore(){if(!exploreRows)return;const a=$('#eA').value,b=$('#eB').value,n=+$('#eDays').value;const rows=exploreRows.slice(-n);
+ mkChart('eChart','line',{labels:rows.map(r=>r.day),datasets:[{label:$('#eA').selectedOptions[0].text,data:rows.map(r=>r[a]),borderColor:'#00e5a0',tension:.3,pointRadius:0,yAxisID:'y'},{label:$('#eB').selectedOptions[0].text,data:rows.map(r=>r[b]),borderColor:'#a78bfa',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left'},y1:{position:'right',grid:{drawOnChartArea:false}}}});}
+function renderGoals(gl){$('#gList').innerHTML=gl.goals.length?gl.goals.map(g=>'<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px"><div style="width:80px">'+ring(g.adherence,g.adherence>=70?'var(--green)':g.adherence>=40?'var(--amber)':'var(--red)','',70)+'</div><div style="flex:1"><b>'+g.label+'</b> '+(g.direction=='min'?'≥':'≤')+' '+g.target+'<div class="muted small">recent avg '+fmt(g.recent)+' · '+g.adherence+'% of days</div></div><button class="b red sm" onclick="delGoal(\''+g.metric+'\')">✕</button></div>').join(''):'<span class="muted small">No goals yet — add one below.</span>';}
+async function saveGoal(){await fetch('/api/goals',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metric:$('#gMetric').value,target:+$('#gTarget').value,direction:$('#gDir').value})});loadExplore();}
+async function delGoal(m){await fetch('/api/goals/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metric:m})});loadExplore();}
+async function runCompare(){const q='a_from='+$('#cAf').value+'&a_to='+$('#cAt').value+'&b_from='+$('#cBf').value+'&b_to='+$('#cBt').value;const d=await api('/api/compare?'+q);
+ const keys=Object.keys(d.deltas);mkChart('cChart','bar',{labels:keys.map(k=>d.labels[k]),datasets:[{label:'A',data:keys.map(k=>d.a[k]),backgroundColor:'#38bdf8'},{label:'B',data:keys.map(k=>d.b[k]),backgroundColor:'#00e5a0'}]});}
 
 /* ---------- PEPTIDES ---------- */
 let pickedDays=new Set([0,1,2,3,4,5,6]);
@@ -1643,13 +2149,11 @@ function tglDay(i){pickedDays.has(i)?pickedDays.delete(i):pickedDays.add(i);rend
 function mondayOf(d){const x=new Date(d);const day=(x.getDay()+6)%7;x.setDate(x.getDate()-day);return x.toISOString().slice(0,10);}
 function dateOfWeek(i){const d=new Date(pWeek);d.setDate(d.getDate()+i);return d.toISOString().slice(0,10);}
 function shiftWeek(n){const d=new Date(pWeek);d.setDate(d.getDate()+n*7);pWeek=mondayOf(d);loadPeptides();}
-async function addPeptide(){const name=$('#pName').value.trim();if(!name){alert('Name?');return;}
- await fetch('/api/peptides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,dose:$('#pDose').value.trim(),days:[...pickedDays].sort()})});
- $('#pName').value='';$('#pDose').value='';loadPeptides();}
+async function addPeptide(){const name=$('#pName').value.trim();if(!name){alert('Name?');return;}await fetch('/api/peptides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,dose:$('#pDose').value.trim(),days:[...pickedDays].sort()})});$('#pName').value='';$('#pDose').value='';loadPeptides();}
 async function delPeptide(pid){if(!confirm('Delete this peptide and its history?'))return;await fetch('/api/peptides/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid})});loadPeptides();}
 async function togglePep(pid,ds,cur){await fetch('/api/peptides/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid,day:ds,taken:!cur})});loadPeptides();}
-async function saveNote(pid){const el=document.getElementById('note-'+pid);await fetch('/api/peptides/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid,week_start:pWeek,note:el.value})});const m=document.getElementById('nmsg-'+pid);if(m){m.textContent='saved ✓';setTimeout(()=>m.textContent='',1200);}}
-async function loadPeptides(){const[d,out]=await Promise.all([api('/api/peptides?week='+pWeek),api('/api/health/peptide-outcomes')]);
+async function saveNote(pid){await fetch('/api/peptides/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid,week_start:pWeek,note:document.getElementById('note-'+pid).value})});const m=document.getElementById('nmsg-'+pid);if(m){m.textContent='saved ✓';setTimeout(()=>m.textContent='',1200);}}
+async function loadPeptides(){const[d,out,corr]=await Promise.all([api('/api/peptides?week='+pWeek),api('/api/health/peptide-outcomes'),api('/api/peptides/correlations')]);
  $('#pWeekLabel').textContent=pWeek;
  if(!d.peptides.length){$('#pGrid').innerHTML='<span class="muted">No peptides yet — add one above.</span>';}
  else{let h='<table><tr><th>Peptide</th>'+DAYS.map((x,i)=>'<th>'+x+'<br><span class="muted" style="font-weight:400">'+dateOfWeek(i).slice(5)+'</span></th>').join('')+'<th>Wk</th></tr>';
@@ -1657,14 +2161,11 @@ async function loadPeptides(){const[d,out]=await Promise.all([api('/api/peptides
   h+='<tr><td><b>'+p.name+'</b>'+(p.dose?' <span class="muted small">'+p.dose+'</span>':'')+'<br><button class="b red sm" style="margin-top:4px" onclick="delPeptide(\''+p.peptide_id+'\')">del</button></td>';
   for(let i=0;i<7;i++){const ds=dateOfWeek(i);if(p.days.includes(i)){const on=!!logs[ds];if(on)taken++;h+='<td><span class="pbox '+(on?'on':'')+'" onclick="togglePep(\''+p.peptide_id+'\',\''+ds+'\','+(on?'true':'false')+')">'+(on?'✓':'')+'</span></td>';}else h+='<td><span class="pbox off"></span></td>';}
   h+='<td class="'+(taken>=sched?'pos':'')+'">'+taken+'/'+sched+'</td></tr>';
-  h+='<tr><td colspan="9" style="border:0"><label>Is it working? — notes for '+p.name+'</label><div class="row"><div><textarea id="note-'+p.peptide_id+'" rows="1">'+(d.notes[p.peptide_id]||'')+'</textarea></div><div style="flex:0"><button class="b g sm" onclick="saveNote(\''+p.peptide_id+'\')">Save</button> <span class="muted small" id="nmsg-'+p.peptide_id+'"></span></div></div></td></tr>';}
- h+='</table>';$('#pGrid').innerHTML=h;}
- // outcomes
- if(!out.peptides.length){$('#pOut').innerHTML='<span class="muted">Add peptides and log doses to see before/during analysis.</span>';return;}
- $('#pOut').innerHTML=out.peptides.map(p=>{if(p.status)return'<div style="margin-bottom:10px"><b>'+p.name+'</b> <span class="muted small">'+p.status+'</span></div>';
-  return'<div class="panel" style="margin-bottom:12px;background:var(--panel2)"><div style="display:flex;justify-content:space-between"><b>'+p.name+(p.dose?' · '+p.dose:'')+'</b><span class="muted small">since '+p.start+' · '+p.doses_logged+' doses · '+p.confidence+' confidence</span></div>'+
-  '<table style="margin-top:8px"><tr><th>Metric</th><th>Before</th><th>During</th><th>Δ</th></tr>'+p.metrics.map(m=>'<tr><td>'+m.label+'</td><td>'+fmt(m.before)+'</td><td>'+fmt(m.during)+'</td><td class="'+(m.delta>0?'pos':m.delta<0?'neg':'')+'">'+(m.delta==null?'—':(m.delta>0?'+':'')+m.delta)+'</td></tr>').join('')+'</table>'+
-  (p.note?'<div class="muted small" style="margin-top:8px">📝 '+p.note+'</div>':'')+'</div>';}).join('');}
+  h+='<tr><td colspan="9" style="border:0"><label>Notes — is '+p.name+' working?</label><div class="row"><div><textarea id="note-'+p.peptide_id+'" rows="1">'+(d.notes[p.peptide_id]||'')+'</textarea></div><div style="flex:0"><button class="b g sm" onclick="saveNote(\''+p.peptide_id+'\')">Save</button> <span class="muted small" id="nmsg-'+p.peptide_id+'"></span></div></div></td></tr>';}
+ $('#pGrid').innerHTML=h+'</table>';}
+ $('#pOut').innerHTML=out.peptides.length?out.peptides.map(p=>p.status?'<div class="muted small">'+p.name+' — '+p.status+'</div>':'<div class="panel" style="background:var(--panel2);margin-bottom:12px"><div style="display:flex;justify-content:space-between"><b>'+p.name+(p.dose?' · '+p.dose:'')+'</b><span class="muted small">since '+p.start+' · '+p.confidence+' confidence</span></div><table style="margin-top:8px"><tr><th>Metric</th><th>Before</th><th>During</th><th>Δ</th></tr>'+p.metrics.map(m=>'<tr><td>'+m.label+'</td><td>'+fmt(m.before)+'</td><td>'+fmt(m.during)+'</td><td class="'+(m.delta>0?'pos':m.delta<0?'neg':'')+'">'+(m.delta==null?'—':(m.delta>0?'+':'')+m.delta)+'</td></tr>').join('')+'</table>'+(p.note?'<div class="muted small" style="margin-top:6px">📝 '+p.note+'</div>':'')+'</div>').join(''):'<span class="muted">Log doses to see analysis.</span>';
+ $('#pCorrNote').textContent=corr.disclaimer;
+ $('#pCorr').innerHTML=corr.peptides.length?corr.peptides.map(p=>p.status?'<div class="muted small">'+p.name+' — '+p.status+'</div>':'<div class="panel" style="background:var(--panel2);margin-bottom:12px"><div style="display:flex;justify-content:space-between"><b>'+p.name+'</b><span class="muted small">'+p.doses+' doses · adherence↔recovery r='+fmt(p.adherence_corr)+'</span></div><table style="margin-top:8px"><tr><th>Metric</th><th>On days</th><th>Off days</th><th>Δ</th><th>Effect</th></tr>'+p.metrics.map(m=>'<tr><td>'+m.label+'</td><td>'+m.on+'</td><td>'+m.off+'</td><td class="'+(m.delta>0?'pos':m.delta<0?'neg':'')+'">'+(m.delta>0?'+':'')+m.delta+'</td><td>'+(Math.abs(m.effect)>=.5?'<b>':'')+m.effect+(Math.abs(m.effect)>=.5?'</b>':'')+'</td></tr>').join('')+'</table></div>').join(''):'<span class="muted">Add peptides &amp; log doses to see correlations.</span>';}
 
 /* ---------- JOURNAL ---------- */
 const PRESET=['alcohol','caffeine_late','late_meal','screen_in_bed','workout','stress','travel','poor_diet','meditation','early_bedtime','hydrated','cold_plunge','social','late_night'];
@@ -1672,9 +2173,7 @@ let chosen=new Set(),customT=[];
 function renderTagBox(){const all=[...PRESET,...customT];$('#tagBox').innerHTML=all.map(t=>'<span class="tag '+(chosen.has(t)?'on':'')+'" onclick="tglTag(\''+t+'\')">'+t+'</span>').join('');}
 function tglTag(t){chosen.has(t)?chosen.delete(t):chosen.add(t);renderTagBox();}
 document.addEventListener('keydown',e=>{if(e.target.id==='jCustom'&&e.key==='Enter'&&e.target.value.trim()){const t=e.target.value.trim().toLowerCase().replace(/\s+/g,'_');if(!customT.includes(t)&&!PRESET.includes(t))customT.push(t);chosen.add(t);e.target.value='';renderTagBox();}});
-async function saveJournal(){const day=$('#jDay').value;if(!day){$('#jMsg').textContent='Pick a date.';return;}
- await fetch('/api/journal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({day,mood:$('#jMood').value?+$('#jMood').value:null,notes:$('#jNotes').value,tags:[...chosen]})});
- $('#jMsg').textContent='Saved ✓';chosen.clear();$('#jNotes').value='';$('#jMood').value='';renderTagBox();loadJournal();setTimeout(()=>$('#jMsg').textContent='',1500);}
+async function saveJournal(){const day=$('#jDay').value;if(!day){$('#jMsg').textContent='Pick a date.';return;}await fetch('/api/journal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({day,mood:$('#jMood').value?+$('#jMood').value:null,notes:$('#jNotes').value,tags:[...chosen]})});$('#jMsg').textContent='Saved ✓';chosen.clear();$('#jNotes').value='';$('#jMood').value='';renderTagBox();loadJournal();setTimeout(()=>$('#jMsg').textContent='',1500);}
 async function loadJournal(){const[j,d]=await Promise.all([api('/api/journal'),api('/api/decisions')]);
  $('#decBaseline').innerHTML='Baseline — recovery <b>'+fmt(d.baseline.recovery)+'%</b>, HRV <b>'+fmt(d.baseline.hrv)+' ms</b>, sleep <b>'+fmt(d.baseline.sleep_quality)+'</b>. ('+d.journal_days+' days)';
  $('#decTable').innerHTML=d.has_data?'<table><tr><th>Habit</th><th>Verdict</th><th>Recovery Δ</th><th>HRV Δ</th><th>Sleep Δ</th><th>n</th></tr>'+d.ratings.map(r=>'<tr><td>'+r.tag+'</td><td class="'+(r.rating==='good call'?'pos':r.rating==='costly'?'neg':'muted')+'">'+r.emoji+' '+r.rating+'</td><td class="'+dc(r.recovery_delta)+'">'+dl(r.recovery_delta)+'</td><td class="'+dc(r.hrv_delta)+'">'+dl(r.hrv_delta)+'</td><td class="'+dc(r.sleep_delta)+'">'+dl(r.sleep_delta)+'</td><td>'+r.n+'</td></tr>').join('')+'</table>':'<span class="muted">Log days with tags to see impact.</span>';
@@ -1682,14 +2181,13 @@ async function loadJournal(){const[j,d]=await Promise.all([api('/api/journal'),a
 const dl=v=>v==null?'—':(v>0?'+':'')+v;const dc=v=>v==null?'':(v>0?'pos':v<0?'neg':'');
 
 /* ---------- CIRCLES ---------- */
-async function loadCircles(){curCircle=null;$('#circleDetail').classList.add('hidden');$('#circlesList').classList.remove('hidden');
- const cs=await api('/api/circles');
+async function loadCircles(){curCircle=null;$('#circleDetail').classList.add('hidden');$('#circlesList').classList.remove('hidden');const cs=await api('/api/circles');
  $('#circleCards').innerHTML=cs.length?cs.map(c=>'<div class="panel ccard" onclick="openCircle(\''+c.circle_id+'\')"><div class="lbl">'+(c.is_owner?'Owner':'Member')+(c.pending?' · <span class="pos">'+c.pending+' pending</span>':'')+'</div><div style="font-size:19px;font-weight:800;margin:4px 0">'+c.name+'</div><div class="muted small">'+c.members+' member'+(c.members===1?'':'s')+'</div></div>').join(''):'<span class="muted">No circles yet.</span>';}
 async function createCircle(){const name=prompt('Name this circle (e.g. Gym crew):');if(!name)return;const r=await api('/api/circles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});alert('Circle created! Invite code: '+r.invite_code+'\nShare it only with people you want in this circle.');loadCircles();}
 async function joinCircle(){const code=prompt('Enter the invite code:');if(!code)return;const r=await api('/api/circles/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});if(r.status==='pending')alert('Request sent! The owner has to approve you.');else if(r.status==='active')alert('You are already in this circle.');else alert(r.detail||'Could not join.');loadCircles();}
 async function openCircle(cid){const d=await api('/api/circle?id='+cid);curCircle=cid;$('#circlesList').classList.add('hidden');const el=$('#circleDetail');el.classList.remove('hidden');const c=d.circle;
  let h='<div class="panel"><button class="b g sm" onclick="loadCircles()">‹ All circles</button> <button class="b red sm" style="float:right" onclick="leaveCircle(\''+cid+'\','+c.is_owner+')">'+(c.is_owner?'Delete circle':'Leave')+'</button><h3 style="margin-top:10px">'+c.name+'</h3>';
- if(c.is_owner)h+='<div class="small">Invite code: <span class="code">'+c.invite_code+'</span> <button class="b g sm" onclick="copyCode(\''+c.invite_code+'\')">copy</button> <button class="b g sm" onclick="revoke(\''+cid+'\')">new code</button><br><span class="muted small">Share only with people you want in this circle.</span></div>';
+ if(c.is_owner)h+='<div class="small">Invite code: <span class="code">'+c.invite_code+'</span> <button class="b g sm" onclick="copyCode(\''+c.invite_code+'\')">copy</button> <button class="b g sm" onclick="revoke(\''+cid+'\')">new code</button></div>';
  h+='</div>';
  if(d.pending.length)h+='<div class="panel"><h3>Pending approvals</h3>'+d.pending.map(p=>'<div class="toggle"><span class="chip">'+p.display_name+'</span><button class="b p sm" onclick="approve(\''+cid+'\','+p.user_id+')">Approve</button><button class="b red sm" onclick="decline(\''+cid+'\','+p.user_id+')">Decline</button></div>').join('')+'</div>';
  const s=d.my_sharing,SH=[['share_recovery','Recovery'],['share_sleep','Sleep'],['share_strain','Strain'],['share_hrv','HRV'],['share_peptides','Peptides']];
@@ -1711,8 +2209,8 @@ function copyCode(c){navigator.clipboard&&navigator.clipboard.writeText(c);}
 function loadSettings(){$('#setName').value=me?me.name:'';}
 async function saveName(){const n=$('#setName').value.trim();if(!n)return;await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_name:n})});me.name=n;$('#sideName').textContent=n;$('#setMsg').textContent='Saved ✓';setTimeout(()=>$('#setMsg').textContent='',1500);}
 
-function mkChart(id,type,data,opts){opts=opts||{};if(charts[id])charts[id].destroy();
- charts[id]=new Chart($('#'+id),{type,data,options:{responsive:true,maintainAspectRatio:false,plugins:Object.assign({legend:{labels:{color:'#7d8b9a'}}},opts.plugins||{}),scales:opts.scales?Object.fromEntries(Object.entries(opts.scales).map(([k,v])=>[k,Object.assign({},v,{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}})])):{x:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}},y:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}}}}});}
+function mkChart(id,type,data,opts){opts=opts||{};const el=$('#'+id);if(!el)return;if(charts[id])charts[id].destroy();
+ charts[id]=new Chart(el,{type,data,options:{responsive:true,maintainAspectRatio:false,plugins:Object.assign({legend:{labels:{color:'#7d8b9a',boxWidth:12}}},opts.plugins||{}),indexAxis:opts.indexAxis||'x',scales:opts.scales?Object.fromEntries(Object.entries(opts.scales).map(([k,v])=>[k,Object.assign({},v,{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}})])):(type==='doughnut'||type==='polarArea'?{}:{x:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}},y:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}}})}});}
 boot();
 </script></body></html>
 """
