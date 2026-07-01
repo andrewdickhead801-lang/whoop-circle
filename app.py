@@ -947,7 +947,8 @@ def sleep_regularity(uid, nights=14):
 
     def mod(iso):
         t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return t.hour * 60 + t.minute
+        # shift so 6pm=0, avoiding midnight wraparound for typical bedtimes
+        return ((t.hour * 60 + t.minute) - 1080 + 1440) % 1440
     onsets, wakes = [mod(s["start"]) for s in sl], [mod(s["end"]) for s in sl]
     sd = (statistics.pstdev(onsets) + statistics.pstdev(wakes)) / 2
     return max(0, min(100, round(100 - sd / 1.5)))
@@ -2024,7 +2025,8 @@ a{color:var(--accent2)}
 </section>
 </main></div>
 <script>
-const $=s=>document.querySelector(s),api=(u,o)=>fetch(u,o).then(r=>r.json());
+const $=s=>document.querySelector(s);
+async function api(u,o){for(let i=0;i<5;i++){try{const r=await fetch(u,o);const t=await r.text();return JSON.parse(t);}catch(e){if(i===4)throw e;await new Promise(z=>setTimeout(z,1200));}}}
 const fmt=v=>(v===null||v===undefined||v==='')?'—':v;
 const DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const TITLES={dashboard:'Dashboard',vitals:'Vitals',sleep:'Sleep',load:'Recovery & Load',insights:'Insights',explore:'Explore',peptides:'Peptides',journal:'Journal',circles:'Circles',report:'Report',settings:'Settings'};
