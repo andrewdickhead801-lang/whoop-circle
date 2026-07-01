@@ -951,7 +951,7 @@ def sleep_regularity(uid, nights=14):
         return ((t.hour * 60 + t.minute) - 1080 + 1440) % 1440
     onsets, wakes = [mod(s["start"]) for s in sl], [mod(s["end"]) for s in sl]
     sd = (statistics.pstdev(onsets) + statistics.pstdev(wakes)) / 2
-    return max(0, min(100, round(100 - sd / 1.5)))
+    return max(0, min(100, round(100 - sd / 3.2)))
 
 
 def sleep_medicine(uid):
@@ -2091,7 +2091,7 @@ async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/
   $('#sDebt').innerHTML='<div class="big" style="color:'+(sm.debt_h>=6?'var(--red)':sm.debt_h>=3?'var(--amber)':'var(--green)')+'">'+fmt(sm.debt_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">last 7 nights</div>';
   $('#sDur').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">per night</div>';
   $('#sJet').innerHTML='<div class="big">'+fmt(cir.social_jetlag_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">weekend shift</div>';
-  const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stColor(x.status))},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
+  const stHex={optimal:'#16e0a3',watch:'#ffb020',flag:'#ff4d5e'};const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stHex[x.status]||'#7d8b9a')},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
   $('#sArchNote').innerHTML=a.map(x=>x.stage+' '+x.pct+'% ('+x.norm+') <span class="dot d-'+x.status+'"></span>').join(' &nbsp; ');
   mkChart('sStage','doughnut',{labels:['Light','REM','Deep'],datasets:[{data:[a.find(x=>x.stage=='Light').pct,a.find(x=>x.stage=='REM').pct,a.find(x=>x.stage=='Deep').pct],backgroundColor:['#38bdf8','#a78bfa','#00e5a0']}]},{plugins:{legend:{position:'bottom'}}});
   // heatmap
