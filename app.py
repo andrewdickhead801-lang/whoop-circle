@@ -2493,7 +2493,7 @@ function refreshActive(){({dashboard:loadDashboard,vitals:loadVitals,sleep:loadS
 function ewHtml(ew){const cls={ok:'ban-ok',watch:'ban-watch',alert:'ban-alert'}[ew.level],ic={ok:'✅',watch:'⚠️',alert:'🚨'}[ew.level];
  let h='<div class="banner '+cls+'"><div style="font-size:15px;font-weight:700;margin-bottom:5px">'+ic+' '+ew.level.toUpperCase()+' · '+ew.confidence+'% confidence</div>'+ew.message;
  if(ew.drivers&&ew.drivers.length)h+='<div style="margin-top:8px">'+ew.drivers.map(d=>'<span class="chip">'+d+'</span>').join('')+'</div>';return h+'</div>';}
-function vitTile(v){const col=stColor(v.status);return'<div class="panel" style="padding:14px"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v">'+v.latest+' <small>'+v.unit+'</small></div></div>'+organImg(v.name,col,44)+'</div><div style="margin-top:6px">'+spark(v.trend,col,150,26)+'</div><div class="muted small" style="margin-top:3px">z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · cv '+v.cv+'%':'')+'</div></div>';}
+function vitTile(v){const col=stColor(v.status);return'<div class="panel" style="padding:14px"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v">'+v.latest+' <small>'+v.unit+'</small></div></div>'+organImg(v.name,col,64)+'</div><div style="margin-top:6px">'+spark(v.trend,col,150,26)+'</div><div class="muted small" style="margin-top:3px">z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · cv '+v.cv+'%':'')+'</div></div>';}
 
 /* ---------- DASHBOARD ---------- */
 async function loadDashboard(){
@@ -2528,10 +2528,12 @@ function organAsset(name){const n=(name||'').toLowerCase();
  if(n.includes('resp')||n.includes('breath'))return'lungs';
  if(n.includes('spo')||n.includes('oxygen')||n.includes('blood'))return'blood';
  if(n.includes('temp'))return'temp';
- if(n.includes('sleep')||n.includes('regularit')||n.includes('debt'))return'brain';
+ if(n.includes('regularit'))return'clock';
+ if(n.includes('debt'))return'hourglass';
+ if(n.includes('duration')||n.includes('sleep'))return'moon';
  return null;}
-function organImg(name,color,size){const a=organAsset(name);if(!a)return'';size=size||46;const c=color||'#00e5a0';
- return '<img src="/asset/'+a+'.jpg" alt="" loading="lazy" style="width:'+size+'px;height:'+size+'px;border-radius:12px;object-fit:cover;flex:0 0 auto;box-shadow:0 0 0 1px '+c+'55,0 0 16px '+c+'2e">';}
+function organImg(name,color,size){const a=organAsset(name);if(!a)return'';size=size||64;const c=color||'#00e5a0';
+ return '<img src="/asset/'+a+'.jpg" alt="" loading="lazy" style="width:'+size+'px;height:'+size+'px;border-radius:14px;object-fit:cover;flex:0 0 auto;box-shadow:0 0 0 1px '+c+'66,0 0 22px '+c+'40">';}
 function trioHtml(r){const u=r.unit?' '+r.unit:'';const cells=[['Today',r.d1],['7-day avg',r.d7],['30-day avg',r.d30]];
  return '<div style="display:flex;gap:6px;margin:8px 0">'+cells.map(c=>'<div style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 2px;text-align:center"><div style="font-size:16px;font-weight:800">'+(c[1]==null?'—':c[1]+u)+'</div><div style="font-size:9px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);margin-top:1px">'+c[0]+'</div></div>').join('')+'</div>';}
 function riskBox(r){const rk=RISKMAP[r.risk]||RISKMAP.ok;const isok=(r.risk||'ok')==='ok';
@@ -2542,7 +2544,7 @@ function riskBox(r){const rk=RISKMAP[r.risk]||RISKMAP.ok;const isok=(r.risk||'ok
   (r.causes?'<div class="muted small" style="margin-top:3px"><b>Common causes:</b> '+r.causes+'</div>':'')+'</div>';}
 function compareHtml(pop){if(!pop||!pop.have_profile)return '<span class="muted small">Set your <b>age &amp; sex</b> in Settings to see how you stack up against the average person your age.</span>';
  return '<div class="muted small" style="margin-bottom:10px">'+pop.note+' Each card shows today, your 7-day and 30-day averages.</div><div class="grid g2">'+pop.rows.map(r=>{const col=r.status==='better'?'#16e0a3':r.status==='below'?'#ff4d5e':'#ffb020';const mx=(Math.max(r.you,r.avg)*1.3)||1;
-  return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><div style="display:flex;align-items:center;gap:11px">'+organImg(r.metric,col,42)+'<b>'+r.metric+'</b></div><span class="badge" style="background:'+col+'22;color:'+col+'">'+r.status+'</span></div>'+
+  return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><div style="display:flex;align-items:center;gap:13px">'+organImg(r.metric,col,64)+'<b>'+r.metric+'</b></div><span class="badge" style="background:'+col+'22;color:'+col+'">'+r.status+'</span></div>'+
    trioHtml(r)+
    '<div class="small" style="margin:6px 0">'+r.plain+'</div>'+
    '<div style="font-size:11px;color:var(--muted)">You (7-day) — '+r.you+' '+r.unit+'</div><div class="pctbar"><div class="pctfill" style="width:'+Math.min(100,r.you/mx*100)+'%;background:'+col+'"></div></div>'+
@@ -2555,7 +2557,7 @@ async function loadVitals(){const[vp,ew,pop]=await Promise.all([api('/api/health
  $('#vCompare').innerHTML=compareHtml(pop);
  const RLBL={good:'✓ Healthy',watch:'⚠ Keep an eye on it',off:'⚑ Pay attention to this'};
  $('#vFull').innerHTML=vp.vitals.map((v,i)=>{const rc={good:'#16e0a3',watch:'#ffb020',off:'#ff4d5e'}[v.rating]||'#7d8b9a';const rl=RLBL[v.rating]||v.rating;
-  return '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div style="display:flex;gap:12px;align-items:center">'+organImg(v.name,rc,54)+'<div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div style="margin-top:8px;background:'+rc+'12;border:1px solid '+rc+'33;border-radius:9px;padding:8px"><span class="badge" style="background:'+rc+'2e;color:'+rc+';font-size:13px;font-weight:800;padding:3px 12px">'+rl+'</span> <span class="small">'+v.plain+'</span></div><div class="muted small" style="margin-top:6px">your range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+'</div></div>';}).join('');}
+  return '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div style="display:flex;gap:14px;align-items:center">'+organImg(v.name,rc,92)+'<div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div style="margin-top:8px;background:'+rc+'12;border:1px solid '+rc+'33;border-radius:9px;padding:8px"><span class="badge" style="background:'+rc+'2e;color:'+rc+';font-size:13px;font-weight:800;padding:3px 12px">'+rl+'</span> <span class="small">'+v.plain+'</span></div><div class="muted small" style="margin-top:6px">your range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+'</div></div>';}).join('');}
 
 /* ---------- SLEEP ---------- */
 async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/sleepmed'),api('/api/sleep'),api('/api/circadian')]);
@@ -2571,7 +2573,7 @@ async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/
   if(sm.breathing&&(sm.breathing.risk!=='ok'||sm.spo2!=null))srItems.push(['Breathing / blood oxygen',{risk:sm.breathing.risk,danger:sm.breathing.note,why:sm.breathing.why,causes:sm.breathing.causes,trio:sm.breathing.trio}]);
   $('#sRisk').innerHTML='<div class="grid g2">'+srItems.map(([name,p])=>{if(!p)return'';
    const rc2={ok:'#16e0a3',watch:'#ffb020',concern:'#ff4d5e'}[p.risk||'ok'];
-   return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;align-items:center;gap:11px">'+organImg(name,rc2,42)+'<b>'+name+'</b></div>'+(p.trio?trioHtml(p.trio):'')+riskBox({risk:p.risk||'ok',risk_note:p.danger,why:p.why,causes:p.causes})+'</div>';}).join('')+'</div><div class="muted small" style="margin-top:8px">Plain-language read of your data — not a medical diagnosis.</div>';
+   return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;align-items:center;gap:13px">'+organImg(name,rc2,64)+'<b>'+name+'</b></div>'+(p.trio?trioHtml(p.trio):'')+riskBox({risk:p.risk||'ok',risk_note:p.danger,why:p.why,causes:p.causes})+'</div>';}).join('')+'</div><div class="muted small" style="margin-top:8px">Plain-language read of your data — not a medical diagnosis.</div>';
   const stHex={optimal:'#16e0a3',watch:'#ffb020',flag:'#ff4d5e'};const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stHex[x.status]||'#7d8b9a')},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
   $('#sArchNote').innerHTML='<div class="muted small" style="margin-bottom:4px">How your night splits into sleep stages vs the clinical healthy range. Deep = physical recovery, REM = mental recovery.</div>'+a.map(x=>'<div class="small"><span class="dot d-'+x.status+'"></span><b>'+x.stage+'</b> '+x.pct+'% <span class="muted">(healthy '+x.norm+') — '+x.plain+'</span></div>').join('');
   mkChart('sStage','doughnut',{labels:['Light','REM','Deep'],datasets:[{data:[a.find(x=>x.stage=='Light').pct,a.find(x=>x.stage=='REM').pct,a.find(x=>x.stage=='Deep').pct],backgroundColor:['#38bdf8','#a78bfa','#00e5a0']}]},{plugins:{legend:{position:'bottom'}}});
