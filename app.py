@@ -875,7 +875,24 @@ def vitals_panel(uid):
         metric("SpO₂", [(r["day"], r["spo2_pct"]) for r in recs], "%", True, "95–100"),
         metric("Skin temp", [(r["day"], r["skin_temp_c"]) for r in recs], "°C", False),
     ]
-    return {"vitals": [v for v in out if v]}
+    out = [v for v in out if v]
+    # add plain-language verdict + age/sex population average
+    u = get_user(uid) or {}
+    nv = norm_values(u.get("age"), u.get("sex")) if (u.get("age") and u.get("sex")) else None
+    POPKEY = {"HRV (rMSSD)": "hrv", "Resting HR": "rhr", "Respiratory rate": "resp", "SpO₂": "spo2"}
+    for v in out:
+        v["rating"] = {"optimal": "good", "watch": "watch", "flag": "off"}[v["status"]]
+        plain = {"optimal": "In your healthy range.", "watch": "Drifting from your usual — keep an eye on it.",
+                 "flag": "Well outside your usual — worth attention."}[v["status"]]
+        avg = nv.get(POPKEY[v["name"]]) if (nv and v["name"] in POPKEY) else None
+        if avg is not None:
+            better = (v["latest"] > avg) if v["higher_better"] else (v["latest"] < avg)
+            pct = abs(v["latest"] - avg) / avg * 100 if avg else 0
+            cmp = "about average" if pct < 6 else ("better than average 👍" if better else "below average")
+            plain += f" You're {cmp} for your age & sex (~{avg} {v['unit']})."
+            v["avg"] = avg
+        v["plain"] = plain
+    return {"vitals": out}
 
 
 def early_warning(uid):
@@ -1015,10 +1032,34 @@ def sleep_medicine(uid):
         flags.append("Average SpO₂ below 95% — worth noting; can relate to disrupted breathing.")
     if dist is not None and dist >= 5:
         flags.append("Frequent nightly disturbances — fragmented sleep.")
-    return {"enough": True, "architecture": arch, "debt_h": sleep_debt(uid),
-            "regularity": sleep_regularity(uid), "avg_hours": _round(_mean([s["hours"] for s in sleeps[-30:]])),
+    reg = sleep_regularity(uid)
+    avg_h = _round(_mean([s["hours"] for s in sleeps[-30:]]))
+    debt = sleep_debt(uid)
+    for a in arch:
+        a["plain"] = {"optimal": "healthy amount", "watch": "a little off the ideal range",
+                      "flag": "outside the healthy range"}[a["status"]]
+
+    def _rate(v, good, ok, higher=True):
+        if v is None:
+            return ("unknown", "neutral", "not enough data yet")
+        ok_hit = (v >= ok) if higher else (v <= ok)
+        good_hit = (v >= good) if higher else (v <= good)
+        return ("great", "good", "") if good_hit else (("okay", "watch", "") if ok_hit else ("poor", "bad", ""))
+    reg_r = _rate(reg, 85, 70, True)
+    dur_r = _rate(avg_h, 7.5, 6.5, True)
+    debt_r = _rate(debt, 3, 6, False)
+    plains = {
+        "regularity": {"label": reg_r[0], "color": reg_r[1],
+                       "text": "how consistent your sleep/wake times are. 85+ is excellent; under 50 means very irregular timing."},
+        "duration": {"label": dur_r[0], "color": dur_r[1],
+                     "text": f"you average {avg_h}h/night. 7–9h is the healthy target for adults."},
+        "debt": {"label": debt_r[0], "color": debt_r[1],
+                 "text": "sleep you owe from short nights this week. Under 3h is great; over 6h means you're running low."},
+    }
+    return {"enough": True, "architecture": arch, "debt_h": debt,
+            "regularity": reg, "avg_hours": avg_h,
             "spo2": _round(spo2), "disturbances": _round(dist), "respiratory_rate": _round(rr),
-            "breathing_flags": flags}
+            "breathing_flags": flags, "plains": plains}
 
 
 def peptide_outcomes(uid, before_days=21):
@@ -2056,6 +2097,7 @@ a{color:var(--accent2)}
 
 <section id="tab-vitals" class="hidden">
 <div class="panel" id="vEw" style="margin-bottom:15px"></div>
+<div class="panel" style="margin-bottom:15px"><h3>How you compare to people your age &amp; sex</h3><div id="vCompare"></div></div>
 <div class="grid g2" id="vFull"></div>
 <p class="muted small" style="margin-top:10px">Each marker compares to <b>your own</b> rolling baseline (shaded band = typical range). z = SDs from baseline · CV = day-to-day variability.</p>
 </section>
@@ -2269,19 +2311,24 @@ function compareHtml(pop){if(!pop||!pop.have_profile)return '<span class="muted 
    '<div class="muted small" style="margin-top:6px">ℹ️ '+r.explain+'</div></div>';}).join('')+'</div>';}
 
 /* ---------- VITALS ---------- */
-async function loadVitals(){const[vp,ew]=await Promise.all([api('/api/health/vitals'),api('/api/health/early-warning')]);
+async function loadVitals(){const[vp,ew,pop]=await Promise.all([api('/api/health/vitals'),api('/api/health/early-warning'),api('/api/health/population')]);
  $('#vEw').innerHTML='<h3>Early-warning</h3>'+ewHtml(ew);
- $('#vFull').innerHTML=vp.vitals.map((v,i)=>'<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div class="muted small" style="margin-top:8px">range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+(v.popref?' · typical '+v.popref:'')+'</div></div>').join('');}
+ $('#vCompare').innerHTML=compareHtml(pop);
+ $('#vFull').innerHTML=vp.vitals.map((v,i)=>{const rc={good:'#16e0a3',watch:'#ffb020',off:'#ff4d5e'}[v.rating]||'#7d8b9a';
+  return '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div class="small" style="margin-top:8px"><span class="badge" style="background:'+rc+'22;color:'+rc+'">'+v.rating+'</span> '+v.plain+'</div><div class="muted small" style="margin-top:6px">your range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+'</div></div>';}).join('');}
 
 /* ---------- SLEEP ---------- */
 async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/sleepmed'),api('/api/sleep'),api('/api/circadian')]);
  if(sm.enough){
-  $('#sSri').innerHTML=ring(sm.regularity,sm.regularity>=85?'var(--green)':sm.regularity>=70?'var(--amber)':'var(--red)','SRI',130);
-  $('#sDebt').innerHTML='<div class="big" style="color:'+(sm.debt_h>=6?'var(--red)':sm.debt_h>=3?'var(--amber)':'var(--green)')+'">'+fmt(sm.debt_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">last 7 nights</div>';
-  $('#sDur').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">per night</div>';
-  $('#sJet').innerHTML='<div class="big">'+fmt(cir.social_jetlag_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">weekend shift</div>';
+  const pl=sm.plains||{},vc={good:'#16e0a3',watch:'#ffb020',bad:'#ff4d5e',neutral:'#7d8b9a'};
+  const rateChip=p=>p?'<span class="badge" style="background:'+vc[p.color]+'22;color:'+vc[p.color]+'">'+p.label+'</span>':'';
+  const rateNote=p=>p?'<div class="muted small" style="margin-top:5px">'+p.text+'</div>':'';
+  $('#sSri').innerHTML=ring(sm.regularity,sm.regularity>=85?'var(--green)':sm.regularity>=70?'var(--amber)':'var(--red)','SRI',130)+'<div style="margin-top:6px">'+rateChip(pl.regularity)+'</div>'+rateNote(pl.regularity);
+  $('#sDebt').innerHTML='<div class="big" style="color:'+(sm.debt_h>=6?'var(--red)':sm.debt_h>=3?'var(--amber)':'var(--green)')+'">'+fmt(sm.debt_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">last 7 nights</div><div style="margin-top:5px">'+rateChip(pl.debt)+'</div>'+rateNote(pl.debt);
+  $('#sDur').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">per night</div><div style="margin-top:5px">'+rateChip(pl.duration)+'</div>'+rateNote(pl.duration);
+  $('#sJet').innerHTML='<div class="big">'+fmt(cir.social_jetlag_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">weekend shift</div><div class="muted small" style="margin-top:5px">difference in your sleep timing on weekends vs weekdays. Under 1h is good.</div>';
   const stHex={optimal:'#16e0a3',watch:'#ffb020',flag:'#ff4d5e'};const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stHex[x.status]||'#7d8b9a')},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
-  $('#sArchNote').innerHTML=a.map(x=>x.stage+' '+x.pct+'% ('+x.norm+') <span class="dot d-'+x.status+'"></span>').join(' &nbsp; ');
+  $('#sArchNote').innerHTML='<div class="muted small" style="margin-bottom:4px">How your night splits into sleep stages vs the clinical healthy range. Deep = physical recovery, REM = mental recovery.</div>'+a.map(x=>'<div class="small"><span class="dot d-'+x.status+'"></span><b>'+x.stage+'</b> '+x.pct+'% <span class="muted">(healthy '+x.norm+') — '+x.plain+'</span></div>').join('');
   mkChart('sStage','doughnut',{labels:['Light','REM','Deep'],datasets:[{data:[a.find(x=>x.stage=='Light').pct,a.find(x=>x.stage=='REM').pct,a.find(x=>x.stage=='Deep').pct],backgroundColor:['#38bdf8','#a78bfa','#00e5a0']}]},{plugins:{legend:{position:'bottom'}}});
   // heatmap
   const pts=cir.points.slice(-30);
@@ -2293,7 +2340,7 @@ async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/
 /* ---------- LOAD ---------- */
 async function loadLoad(){const[ld,rc,wo]=await Promise.all([api('/api/health/load'),api('/api/recovery'),api('/api/workouts')]);
  if(ld.enough){
-  $('#lAcwr').innerHTML=ring(Math.min(100,Math.round(ld.acwr/2*100)),zoneColor(ld.zone),ld.zone,130);
+  $('#lAcwr').innerHTML=ring(Math.min(100,Math.round(ld.acwr/2*100)),zoneColor(ld.zone),ld.zone,130)+'<div class="muted small" style="margin-top:6px">'+ld.message+'<br><span style="opacity:.8">Compares this week\'s training to your recent norm. 0.8–1.3 is the safe sweet spot.</span></div>';
   $('#lAcute').innerHTML='<div class="big">'+ld.acute+'</div><div class="lbl">7d EWMA strain</div>';
   $('#lChronic').innerHTML='<div class="big">'+ld.chronic+'</div><div class="lbl">28d EWMA strain</div>';
   const labels=ld.series.map(p=>p.day);
@@ -2315,7 +2362,8 @@ async function loadInsights(){const[dr,fc,wy,tr,an]=await Promise.all([api('/api
  if(wy.has_data){$('#iWhy').innerHTML='<div class="muted small" style="margin-bottom:8px">'+wy.day+' · recovery '+fmt(wy.recovery)+'%'+(wy.habits.length?' · logged: '+wy.habits.join(', '):'')+'</div>'+(wy.reasons.length?wy.reasons.map(r=>'<div class="insight" style="border-left-color:'+(r.impact=='helped'?'var(--green)':r.impact=='hurt'?'var(--red)':'var(--accent2)')+'">'+r.factor+' was <b>'+r.note+'</b> ('+(r.z>0?'+':'')+r.z+' SD) — '+r.impact+'</div>').join(''):'<span class="muted">Everything near your baseline today.</span>');}
  else $('#iWhy').innerHTML='<span class="muted">Need more data.</span>';
  $('#iTrends').innerHTML=tr.metrics.map(m=>{const good=m.higher_better;const wc=m.wow==null?'':(m.wow>0)===(good!==false)?'pos':'neg';const mc=m.mom==null?'':(m.mom>0)===(good!==false)?'pos':'neg';
-  return'<div class="panel" style="padding:14px"><div class="lbl">'+m.metric+'</div><div class="v" style="font-size:24px">'+m.latest+'</div><div style="margin:4px 0">'+spark(m.spark,'#38bdf8',150,26)+'</div><div class="small muted">7d '+m.avg7+' · 30d '+m.avg30+'</div><div class="small">WoW <b class="'+wc+'">'+(m.wow>0?'+':'')+fmt(m.wow)+'</b> · MoM <b class="'+mc+'">'+(m.mom>0?'+':'')+fmt(m.mom)+'</b></div><div class="small muted" style="margin-top:4px">percentile '+m.percentile+'</div>'+pctbar(m.percentile)+'</div>';}).join('');
+  const pv=m.percentile,pw=pv==null?'':(pv>=66?'in the top third of your usual':pv>=33?'about your usual':'in the low third of your usual');
+  return'<div class="panel" style="padding:14px"><div class="lbl">'+m.metric+'</div><div class="v" style="font-size:24px">'+m.latest+'</div><div style="margin:4px 0">'+spark(m.spark,'#38bdf8',150,26)+'</div><div class="small muted">7d '+m.avg7+' · 30d '+m.avg30+'</div><div class="small">WoW <b class="'+wc+'">'+(m.wow>0?'+':'')+fmt(m.wow)+'</b> · MoM <b class="'+mc+'">'+(m.mom>0?'+':'')+fmt(m.mom)+'</b></div>'+pctbar(m.percentile)+'<div class="small muted" style="margin-top:4px">Today is '+pw+' (percentile '+m.percentile+').</div></div>';}).join('');
  $('#iAnom').innerHTML=an.events.length?'<div class="tl">'+an.events.map(e=>'<div class="tlrow"><b>'+e.day+'</b> — '+e.metric+' unusually <b class="'+(e.direction=='high'?'pos':'neg')+'">'+e.direction+'</b> ('+(e.z>0?'+':'')+e.z+' SD, '+e.value+')</div>').join('')+'</div>':'<span class="muted">No anomalies detected.</span>';}
 
 /* ---------- EXPLORE ---------- */
