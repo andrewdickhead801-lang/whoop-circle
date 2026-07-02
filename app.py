@@ -397,6 +397,7 @@ def _run_sync(uid, start_iso, label):
         _sync[uid]["error"] = str(e)
     finally:
         _sync[uid]["running"] = False
+        bust_cache(uid)
 
 
 def full_sync_async(uid):
@@ -464,26 +465,55 @@ def _verdict(s):
     return "poor"
 
 
+# --- lightweight per-user cache so a tab's many calls don't re-read the DB each time ---
+_DCACHE = {}
+_DCACHE_TTL = 90
+
+
+def _cached(uid, key, fn):
+    now = time.time()
+    e = _DCACHE.get((uid, key))
+    if e and now - e[0] < _DCACHE_TTL:
+        return e[1]
+    v = fn()
+    _DCACHE[(uid, key)] = (now, v)
+    return v
+
+
+def bust_cache(uid=None):
+    if uid is None:
+        _DCACHE.clear()
+    else:
+        for k in [k for k in _DCACHE if k[0] == uid]:
+            _DCACHE.pop(k, None)
+
+
 def _sleeps(uid):
-    r = rows('SELECT * FROM sleeps WHERE user_id=? AND nap=0 AND score_state=? ORDER BY start ASC', (uid, "SCORED"))
-    for x in r:
-        x["day"] = str(_date(x["start"])); x["quality"] = sleep_quality_score(x)
-        x["hours"] = round((x.get("total_in_bed_ms") or 0) / MS_PER_HOUR, 2)
-    return r
+    def build():
+        r = rows('SELECT * FROM sleeps WHERE user_id=? AND nap=0 AND score_state=? ORDER BY start ASC', (uid, "SCORED"))
+        for x in r:
+            x["day"] = str(_date(x["start"])); x["quality"] = sleep_quality_score(x)
+            x["hours"] = round((x.get("total_in_bed_ms") or 0) / MS_PER_HOUR, 2)
+        return r
+    return _cached(uid, "sleeps", build)
 
 
 def _recs(uid):
-    r = rows('SELECT * FROM recoveries WHERE user_id=? AND score_state=? ORDER BY created_at ASC', (uid, "SCORED"))
-    for x in r:
-        x["day"] = str(_date(x["created_at"]))
-    return r
+    def build():
+        r = rows('SELECT * FROM recoveries WHERE user_id=? AND score_state=? ORDER BY created_at ASC', (uid, "SCORED"))
+        for x in r:
+            x["day"] = str(_date(x["created_at"]))
+        return r
+    return _cached(uid, "recs", build)
 
 
 def _cycles(uid):
-    r = rows('SELECT * FROM cycles WHERE user_id=? AND score_state=? ORDER BY start ASC', (uid, "SCORED"))
-    for x in r:
-        x["day"] = str(_date(x["start"]))
-    return r
+    def build():
+        r = rows('SELECT * FROM cycles WHERE user_id=? AND score_state=? ORDER BY start ASC', (uid, "SCORED"))
+        for x in r:
+            x["day"] = str(_date(x["start"]))
+        return r
+    return _cached(uid, "cycles", build)
 
 
 def counts(uid):
@@ -1088,6 +1118,9 @@ def _percentile(vals, v):
 
 
 def feature_frame(uid):
+    cached = _DCACHE.get((uid, "frame"))
+    if cached and time.time() - cached[0] < _DCACHE_TTL:
+        return cached[1]
     recs = {r["day"]: r for r in _recs(uid)}
     sleeps = {s["day"]: s for s in _sleeps(uid)}
     cycles = {c["day"]: c for c in _cycles(uid)}
@@ -1110,6 +1143,7 @@ def feature_frame(uid):
             "strain": c.get("strain") if c else None,
         })
     out.sort(key=lambda x: x["day"])
+    _DCACHE[(uid, "frame")] = (time.time(), out)
     return out
 
 
@@ -1356,7 +1390,13 @@ def goals_status(uid):
 def peptide_correlations(uid):
     recs = {r["day"]: r for r in _recs(uid)}
     sleeps = {s["day"]: s for s in _sleeps(uid)}
+    cycles = {c["day"]: c for c in _cycles(uid)}
     peps = rows("SELECT * FROM peptides WHERE user_id=?", (uid,))
+    # (label, source, key, higher_is_better) ; None = neutral (not scored in verdict)
+    METRIC_SPEC = [("Recovery %", recs, "recovery_pct", True), ("HRV ms", recs, "hrv_rmssd_ms", True),
+                   ("Sleep performance %", sleeps, "performance_pct", True),
+                   ("Sleep quality", sleeps, "quality", True), ("Resting HR", recs, "resting_hr", False),
+                   ("Strain", cycles, "strain", None)]
     results = []
     for p in peps:
         taken = [x["day"] for x in rows(
@@ -1367,16 +1407,21 @@ def peptide_correlations(uid):
             continue
         taken_set = set(taken)
         metrics = []
-        for label, src, key in (("Recovery %", recs, "recovery_pct"), ("HRV ms", recs, "hrv_rmssd_ms"),
-                                ("Sleep quality", sleeps, "quality"), ("Resting HR", recs, "resting_hr")):
+        good = bad = 0
+        for label, src, key, hb in METRIC_SPEC:
             on = [src[d][key] for d in src if d in taken_set and src[d].get(key) is not None]
             off = [src[d][key] for d in src if d not in taken_set and src[d].get(key) is not None]
             if len(on) >= 3 and len(off) >= 3:
                 mon, moff = statistics.fmean(on), statistics.fmean(off)
                 pooled = (statistics.pstdev(on) + statistics.pstdev(off)) / 2 or 1e-9
+                eff = round((mon - moff) / pooled, 2)
                 metrics.append({"label": label, "on": round(mon, 1), "off": round(moff, 1),
-                                "delta": round(mon - moff, 1), "effect": round((mon - moff) / pooled, 2),
+                                "delta": round(mon - moff, 1), "effect": eff,
                                 "n_on": len(on), "n_off": len(off)})
+                if hb is not None and abs(eff) >= 0.3:
+                    helps = (eff > 0) == hb
+                    good += 1 if helps else 0
+                    bad += 1 if not helps else 0
         # weekly adherence vs weekly recovery correlation
         wk_adh, wk_rec = {}, defaultdict(list)
         days_sched = json.loads(p.get("days_json") or "[]")
@@ -1397,8 +1442,15 @@ def peptide_correlations(uid):
             pairs_x.append(wk_adh.get(wk, 0)); pairs_y.append(statistics.fmean(wk_rec[wk]))
         adh_corr = _pearson(pairs_x, pairs_y)
         conf = "low" if (not metrics or min((m["n_on"] for m in metrics), default=0) < 7) else "moderate"
+        if good > bad and good:
+            verdict, vcolor = "helping", "good"
+        elif bad > good and bad:
+            verdict, vcolor = "possible adverse", "bad"
+        else:
+            verdict, vcolor = "neutral", "neutral"
         results.append({"name": p["name"], "dose": p.get("dose"), "doses": len(taken),
-                        "metrics": metrics, "adherence_corr": _round(adh_corr, 2), "confidence": conf})
+                        "metrics": metrics, "adherence_corr": _round(adh_corr, 2), "confidence": conf,
+                        "verdict": verdict, "vcolor": vcolor})
     return {"peptides": results,
             "disclaimer": "Personal within-subject tracking only — correlation is not causation, "
                           "confounders exist, and small samples are noisy. Not medical advice."}
@@ -1487,6 +1539,17 @@ def api_sync_status(request: Request):
 @app.get("/api/overview")
 def api_overview(request: Request):
     return overview(require(request))
+
+
+@app.get("/api/dashboard")
+def api_dashboard(request: Request):
+    uid = require(request)
+    rc = recovery_report(uid)
+    return {"readiness": readiness(uid), "early_warning": early_warning(uid),
+            "vitals": vitals_panel(uid)["vitals"], "load": load_acwr(uid),
+            "sleep": sleep_medicine(uid), "overview": overview(uid),
+            "narrative": weekly_narrative(uid)["narrative"],
+            "recovery_series": rc["series"][-30:]}
 
 
 @app.get("/api/sleep")
@@ -1859,10 +1922,12 @@ a{color:var(--accent2)}
 .hm{display:flex;flex-direction:column;gap:2px}.hmrow{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)}
 .hmtrack{flex:1;height:11px;border-radius:4px;background:var(--panel2);position:relative}
 .hmbar{position:absolute;top:0;bottom:0;background:linear-gradient(90deg,var(--violet),var(--accent2));border-radius:4px;opacity:.85}
+#bar{position:fixed;top:0;left:0;height:3px;width:0;opacity:0;background:linear-gradient(90deg,var(--accent2),var(--accent));z-index:99;transition:width .3s ease,opacity .3s ease;box-shadow:0 0 8px var(--accent)}
 .tl{border-left:2px solid var(--line);margin-left:6px;padding-left:14px}
 .tlrow{position:relative;padding:7px 0;font-size:13.5px}
 .tlrow:before{content:'';position:absolute;left:-21px;top:12px;width:9px;height:9px;border-radius:50%;background:var(--accent2)}
 </style></head><body>
+<div id="bar"></div>
 <div id="signin" class="center hidden">
 <div style="font-size:30px;font-weight:800;letter-spacing:1px">WHOOP <span style="color:var(--accent)">CIRCLE</span></div>
 <p class="muted" style="max-width:460px;margin:14px auto">Clinical-grade analytics on your WHOOP data — a full command center, deep insights, forecasting, a peptide tracker with correlations, and private friend circles.</p>
@@ -1983,6 +2048,7 @@ a{color:var(--accent2)}
 <div class="row"><div><label>Name</label><input id="pName" placeholder="e.g. GHK-Cu"></div><div><label>Dose</label><input id="pDose" placeholder="e.g. 2mg"></div></div>
 <label>Days of the week</label><div id="pDays"></div>
 <div style="margin-top:10px"><button class="b p" onclick="addPeptide()">Add peptide</button></div></div>
+<div class="panel"><h3>My peptides</h3><div id="pVials" class="grid cards"></div></div>
 <div class="panel"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
 <h3 style="margin:0">Week of <span id="pWeekLabel"></span></h3>
 <div><button class="b g sm" onclick="shiftWeek(-1)">‹ Prev</button> <button class="b g sm" onclick="shiftWeek(1)">Next ›</button></div></div>
@@ -1990,6 +2056,7 @@ a{color:var(--accent2)}
 <div class="panel"><h3>Outcomes — before vs during</h3><div id="pOut"></div></div>
 <div class="panel"><h3>Peptide ↔ health correlations</h3>
 <p class="muted small" style="margin-top:-6px" id="pCorrNote"></p><div id="pCorr"></div></div>
+<div class="panel"><h3>Peptide library</h3><div id="pLib" class="grid cards"></div></div>
 </section>
 
 <section id="tab-journal" class="hidden">
@@ -2026,7 +2093,10 @@ a{color:var(--accent2)}
 </main></div>
 <script>
 const $=s=>document.querySelector(s);
-async function api(u,o){for(let i=0;i<5;i++){try{const r=await fetch(u,o);const t=await r.text();return JSON.parse(t);}catch(e){if(i===4)throw e;await new Promise(z=>setTimeout(z,1200));}}}
+let _inflight=0;
+async function api(u,o){_inflight++;const bar=document.getElementById('bar');if(bar){bar.style.opacity='1';bar.style.width='75%';}
+ try{for(let i=0;i<5;i++){try{const r=await fetch(u,o);const t=await r.text();return JSON.parse(t);}catch(e){if(i===4)throw e;await new Promise(z=>setTimeout(z,1200));}}}
+ finally{_inflight=Math.max(0,_inflight-1);if(_inflight===0&&bar){bar.style.width='100%';setTimeout(()=>{bar.style.width='0';bar.style.opacity='0';},260);}}}
 const fmt=v=>(v===null||v===undefined||v==='')?'—':v;
 const DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const TITLES={dashboard:'Dashboard',vitals:'Vitals',sleep:'Sleep',load:'Recovery & Load',insights:'Insights',explore:'Explore',peptides:'Peptides',journal:'Journal',circles:'Circles',report:'Report',settings:'Settings'};
@@ -2047,6 +2117,27 @@ function ring(score,color,sub,size){size=size||150;const R=size/2-13,C=2*Math.PI
 function refbar(low,high,latest){const pad=(high-low)||1,min=low-pad,max=high+pad,rg=(max-min)||1;
  return'<div class="refbar"><div class="refband" style="left:'+((low-min)/rg*100)+'%;width:'+((high-low)/rg*100)+'%"></div><div class="refmark" style="left:'+Math.max(0,Math.min(100,(latest-min)/rg*100))+'%"></div></div>';}
 function pctbar(p){return'<div class="pctbar"><div class="pctfill" style="width:'+(p||0)+'%"></div></div>';}
+/* peptide catalog: name -> [use, liquid tint] */
+const PEPTINFO={'BPC-157':['tissue repair / gut','#bcdcff'],'TB-500':['recovery / healing','#d3c8ff'],'GHK-Cu':['skin / collagen','#5fc9c0'],'Ipamorelin':['GH secretagogue','#e4d8ff'],'CJC-1295':['GH secretagogue','#c7e2ff'],'Sermorelin':['GH / sleep','#d2efe4'],'Tesamorelin':['fat loss / GH','#c7e2ff'],'GHRP-2':['GH / appetite','#e4d8ff'],'GHRP-6':['GH / appetite','#e6dcff'],'Hexarelin':['GH pulse','#d7e6ff'],'MK-677':['oral GH / sleep','#ffdfae'],'IGF-1 LR3':['growth / recovery','#c7e2ff'],'Melanotan II':['tan / libido','#e6bf94'],'Melanotan I':['tan','#edcfa2'],'PT-141':['libido','#f5c2d3'],'Semaglutide':['GLP-1 / weight','#dce9ff'],'Tirzepatide':['GLP-1/GIP / weight','#dce9ff'],'Retatrutide':['triple-G / weight','#dce9ff'],'AOD-9604':['fat loss','#d2efe4'],'Epitalon':['longevity / sleep','#e3d7ff']};
+function pepTint(name){const k=Object.keys(PEPTINFO).find(x=>name&&name.toLowerCase().replace(/[^a-z0-9]/g,'').startsWith(x.toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,4)));return k?PEPTINFO[k][1]:'#8be3c9';}
+function vial(name,fill,glow,tint){fill=Math.max(0,Math.min(1,fill||0));tint=tint||'#8be3c9';glow=glow||'#16e0a3';
+ const innerTop=58,liqBottom=190,top=44,level=innerTop+(1-fill)*(liqBottom-innerTop),u=Math.random().toString(36).slice(2,7);
+ let fs=13;if(name&&name.length>10)fs=11;if(name&&name.length>13)fs=9.5;
+ return '<svg viewBox="0 0 140 220" width="100%" style="max-width:130px"><defs>'+
+ '<linearGradient id="g'+u+'" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity=".26"/><stop offset=".25" stop-color="#fff" stop-opacity=".05"/><stop offset=".7" stop-color="#000" stop-opacity=".10"/><stop offset="1" stop-color="#000" stop-opacity=".22"/></linearGradient>'+
+ '<linearGradient id="l'+u+'" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="'+tint+'" stop-opacity=".95"/><stop offset="1" stop-color="'+tint+'" stop-opacity=".7"/></linearGradient>'+
+ '<radialGradient id="gl'+u+'" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="'+glow+'" stop-opacity=".55"/><stop offset="1" stop-color="'+glow+'" stop-opacity="0"/></radialGradient>'+
+ '<clipPath id="c'+u+'"><path d="M40 '+innerTop+' h60 v118 a30 30 0 0 1 -60 0 z"/></clipPath></defs>'+
+ '<ellipse cx="70" cy="120" rx="66" ry="92" fill="url(#gl'+u+')"/>'+
+ '<path d="M40 '+innerTop+' h60 v118 a30 30 0 0 1 -60 0 z" fill="#0e161d" stroke="'+glow+'" stroke-opacity=".5" stroke-width="1.5"/>'+
+ '<g clip-path="url(#c'+u+')"><rect x="38" y="'+level+'" width="64" height="'+(liqBottom-level+8)+'" fill="url(#l'+u+')"/><ellipse cx="70" cy="'+level+'" rx="30" ry="4" fill="'+tint+'"/></g>'+
+ '<path d="M40 '+innerTop+' h60 v118 a30 30 0 0 1 -60 0 z" fill="url(#g'+u+')"/>'+
+ '<rect x="47" y="66" width="7" height="120" rx="3.5" fill="#fff" opacity=".22"/>'+
+ '<rect x="52" y="'+top+'" width="36" height="16" fill="#cfd8e0"/><rect x="48" y="'+(top-14)+'" width="44" height="16" rx="3" fill="#aeb8c2"/><rect x="54" y="'+(top-22)+'" width="32" height="10" rx="3" fill="#6b7480"/>'+
+ '<rect x="34" y="118" width="72" height="46" rx="5" fill="#f4f7fa" opacity=".95"/><rect x="34" y="118" width="72" height="12" rx="5" fill="'+glow+'" opacity=".85"/>'+
+ '<text x="70" y="147" text-anchor="middle" font-family="Inter,Arial" font-weight="800" font-size="'+fs+'" fill="#0b0f14">'+(name||'')+'</text>'+
+ '<text x="70" y="159" text-anchor="middle" font-family="Inter,Arial" font-size="7" fill="#5b6b78" letter-spacing="1">WHOOP CIRCLE</text></svg>';}
+const vColor=v=>({good:'#16e0a3',bad:'#ff4d5e',neutral:'#ffb020'}[v]||'#ffb020');
 
 async function boot(){const m=await api('/api/me');me=m;
  if(!m.signed_in){$('#signin').classList.remove('hidden');if(!m.has_credentials)$('#credWarn').innerHTML='⚠️ Server has no WHOOP credentials configured yet.';return;}
@@ -2068,16 +2159,16 @@ function vitTile(v){return'<div class="panel" style="padding:14px"><div class="l
 
 /* ---------- DASHBOARD ---------- */
 async function loadDashboard(){
- const[rd,ew,vp,ld,sm,ov,nar,rc]=await Promise.all([api('/api/health/readiness'),api('/api/health/early-warning'),api('/api/health/vitals'),api('/api/health/load'),api('/api/health/sleepmed'),api('/api/overview'),api('/api/health/narrative'),api('/api/recovery')]);
+ const d=await api('/api/dashboard');const rd=d.readiness,ew=d.early_warning,ld=d.load,sm=d.sleep,ov=d.overview;
  $('#dRing').innerHTML=ring(rd.score,bandColor(rd.band),rd.band||'',160);$('#dRec').textContent=rd.recommendation||'';
  $('#dEw').innerHTML=ewHtml(ew);
  $('#dLoad').innerHTML=ld.enough?'<div class="big" style="color:'+zoneColor(ld.zone)+'">'+ld.acwr+'</div><div class="lbl">ACWR · '+ld.zone+'</div><div class="muted small" style="margin-top:6px">acute '+ld.acute+' / chronic '+ld.chronic+'</div>':'<span class="muted small">Need 2+ weeks.</span>';
  $('#dSleep').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:16px" class="muted">h</small></div><div class="lbl">avg sleep</div><div class="muted small" style="margin-top:6px">'+(sm.debt_h!=null?sm.debt_h+'h debt · ':'')+(sm.regularity!=null?'SRI '+sm.regularity:'')+'</div>';
  const L=ov.latest;$('#dLatest').innerHTML='<div class="big">'+fmt(L.recovery_pct)+'<small style="font-size:16px" class="muted">%</small></div><div class="lbl">recovery</div><div class="muted small" style="margin-top:6px">strain '+fmt(L.strain)+' · sleep '+fmt(L.sleep_quality)+'</div>';
- $('#dVitals').innerHTML=vp.vitals.map(vitTile).join('');
- const s=rc.series.slice(-30),labels=s.map(p=>p.day);
+ $('#dVitals').innerHTML=d.vitals.map(vitTile).join('');
+ const s=d.recovery_series,labels=s.map(p=>p.day);
  mkChart('dChart','line',{labels,datasets:[{label:'Recovery %',data:s.map(p=>p.recovery),borderColor:'#16e0a3',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Strain',data:s.map(p=>p.strain),borderColor:'#ff8a3a',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:100},y1:{position:'right',min:0,max:21,grid:{drawOnChartArea:false}}}});
- $('#dNarr').innerHTML=nar.narrative;}
+ $('#dNarr').innerHTML=d.narrative;}
 
 /* ---------- VITALS ---------- */
 async function loadVitals(){const[vp,ew]=await Promise.all([api('/api/health/vitals'),api('/api/health/early-warning')]);
@@ -2157,6 +2248,12 @@ async function togglePep(pid,ds,cur){await fetch('/api/peptides/toggle',{method:
 async function saveNote(pid){await fetch('/api/peptides/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid,week_start:pWeek,note:document.getElementById('note-'+pid).value})});const m=document.getElementById('nmsg-'+pid);if(m){m.textContent='saved ✓';setTimeout(()=>m.textContent='',1200);}}
 async function loadPeptides(){const[d,out,corr]=await Promise.all([api('/api/peptides?week='+pWeek),api('/api/health/peptide-outcomes'),api('/api/peptides/correlations')]);
  $('#pWeekLabel').textContent=pWeek;
+ const vmap={};(corr.peptides||[]).forEach(p=>{if(p.vcolor)vmap[p.name]={color:vColor(p.vcolor),verdict:p.verdict};});
+ // adaptive "my peptides" vials
+ $('#pVials').innerHTML=d.peptides.length?d.peptides.map(p=>{const logs=d.logs[p.peptide_id]||{};let taken=0;p.days.forEach(i=>{if(logs[dateOfWeek(i)])taken++;});const adh=p.days.length?taken/p.days.length:0;const v=vmap[p.name]||{color:'#7d8b9a',verdict:'need data'};
+  return '<div class="panel" style="padding:12px;text-align:center">'+vial(p.name,adh,v.color,pepTint(p.name))+'<div class="nm" style="font-weight:700;font-size:13px;margin-top:4px">'+p.name+'</div><div class="muted small">'+Math.round(adh*100)+'% this wk</div><span class="badge" style="background:'+v.color+'22;color:'+v.color+';margin-top:4px">'+v.verdict+'</span></div>';}).join(''):'<span class="muted small">Add a peptide to see its adaptive vial.</span>';
+ // full library
+ $('#pLib').innerHTML=Object.entries(PEPTINFO).map(([n,i])=>'<div class="panel" style="padding:12px;text-align:center">'+vial(n,0.7,'#16e0a3',i[1])+'<div style="font-weight:700;font-size:13px;margin-top:4px">'+n+'</div><div class="muted small">'+i[0]+'</div></div>').join('');
  if(!d.peptides.length){$('#pGrid').innerHTML='<span class="muted">No peptides yet — add one above.</span>';}
  else{let h='<table><tr><th>Peptide</th>'+DAYS.map((x,i)=>'<th>'+x+'<br><span class="muted" style="font-weight:400">'+dateOfWeek(i).slice(5)+'</span></th>').join('')+'<th>Wk</th></tr>';
  for(const p of d.peptides){const logs=d.logs[p.peptide_id]||{};let taken=0,sched=p.days.length;
@@ -2167,7 +2264,7 @@ async function loadPeptides(){const[d,out,corr]=await Promise.all([api('/api/pep
  $('#pGrid').innerHTML=h+'</table>';}
  $('#pOut').innerHTML=out.peptides.length?out.peptides.map(p=>p.status?'<div class="muted small">'+p.name+' — '+p.status+'</div>':'<div class="panel" style="background:var(--panel2);margin-bottom:12px"><div style="display:flex;justify-content:space-between"><b>'+p.name+(p.dose?' · '+p.dose:'')+'</b><span class="muted small">since '+p.start+' · '+p.confidence+' confidence</span></div><table style="margin-top:8px"><tr><th>Metric</th><th>Before</th><th>During</th><th>Δ</th></tr>'+p.metrics.map(m=>'<tr><td>'+m.label+'</td><td>'+fmt(m.before)+'</td><td>'+fmt(m.during)+'</td><td class="'+(m.delta>0?'pos':m.delta<0?'neg':'')+'">'+(m.delta==null?'—':(m.delta>0?'+':'')+m.delta)+'</td></tr>').join('')+'</table>'+(p.note?'<div class="muted small" style="margin-top:6px">📝 '+p.note+'</div>':'')+'</div>').join(''):'<span class="muted">Log doses to see analysis.</span>';
  $('#pCorrNote').textContent=corr.disclaimer;
- $('#pCorr').innerHTML=corr.peptides.length?corr.peptides.map(p=>p.status?'<div class="muted small">'+p.name+' — '+p.status+'</div>':'<div class="panel" style="background:var(--panel2);margin-bottom:12px"><div style="display:flex;justify-content:space-between"><b>'+p.name+'</b><span class="muted small">'+p.doses+' doses · adherence↔recovery r='+fmt(p.adherence_corr)+'</span></div><table style="margin-top:8px"><tr><th>Metric</th><th>On days</th><th>Off days</th><th>Δ</th><th>Effect</th></tr>'+p.metrics.map(m=>'<tr><td>'+m.label+'</td><td>'+m.on+'</td><td>'+m.off+'</td><td class="'+(m.delta>0?'pos':m.delta<0?'neg':'')+'">'+(m.delta>0?'+':'')+m.delta+'</td><td>'+(Math.abs(m.effect)>=.5?'<b>':'')+m.effect+(Math.abs(m.effect)>=.5?'</b>':'')+'</td></tr>').join('')+'</table></div>').join(''):'<span class="muted">Add peptides &amp; log doses to see correlations.</span>';}
+ $('#pCorr').innerHTML=corr.peptides.length?corr.peptides.map(p=>p.status?'<div class="muted small">'+p.name+' — '+p.status+'</div>':'<div class="panel" style="background:var(--panel2);margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:center"><b>'+p.name+' <span class="badge" style="background:'+vColor(p.vcolor)+'22;color:'+vColor(p.vcolor)+'">'+(p.vcolor==="good"?"✅ ":p.vcolor==="bad"?"⚠️ ":"➖ ")+p.verdict+'</span></b><span class="muted small">'+p.doses+' doses · adherence↔recovery r='+fmt(p.adherence_corr)+'</span></div><table style="margin-top:8px"><tr><th>Metric</th><th>On days</th><th>Off days</th><th>Δ</th><th>Effect</th></tr>'+p.metrics.map(m=>'<tr><td>'+m.label+'</td><td>'+m.on+'</td><td>'+m.off+'</td><td class="'+(m.delta>0?'pos':m.delta<0?'neg':'')+'">'+(m.delta>0?'+':'')+m.delta+'</td><td>'+(Math.abs(m.effect)>=.5?'<b>':'')+m.effect+(Math.abs(m.effect)>=.5?'</b>':'')+'</td></tr>').join('')+'</table></div>').join(''):'<span class="muted">Add peptides &amp; log doses to see correlations.</span>';}
 
 /* ---------- JOURNAL ---------- */
 const PRESET=['alcohol','caffeine_late','late_meal','screen_in_bed','workout','stress','travel','poor_diet','meditation','early_bedtime','hydrated','cold_plunge','social','late_night'];
