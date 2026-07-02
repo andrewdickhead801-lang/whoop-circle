@@ -1558,6 +1558,86 @@ def population_compare(uid):
             "note": "Compared to published population averages for your age & sex. General reference, not a diagnosis."}
 
 
+# ============================================================ OVERALL SUMMARY
+REASONS = {
+    "HRV (rMSSD)": ["short or poor sleep", "alcohol the night before", "high stress or hard training",
+                    "fighting off something", "dehydration", "and it's naturally lower with age & genetics"],
+    "Resting HR": ["incomplete recovery or overtraining", "alcohol or late caffeine", "stress or poor sleep",
+                   "an oncoming illness", "dehydration", "lower fitness (this one's very trainable)"],
+    "Respiratory rate": ["an oncoming cold/illness", "alcohol", "stress", "a warm or stuffy room"],
+    "SpO₂": ["disrupted breathing during sleep", "congestion or illness", "high altitude",
+             "and baseline varies a lot person-to-person"],
+    "Skin temp": ["an oncoming fever/illness", "alcohol", "a warm room", "hormonal cycle"],
+    "Sleep duration": ["late bedtimes", "screens or caffeine too late", "stress", "a packed schedule"],
+}
+
+
+def overall_health(uid):
+    vitals = vitals_panel(uid)["vitals"]
+    sm = sleep_medicine(uid)
+    items = []  # (name, status good/watch/off, higher_better, plain)
+    for v in vitals:
+        items.append({"name": v["name"], "rating": v["rating"], "plain": v.get("plain", "")})
+    if sm.get("enough"):
+        dur = sm.get("plains", {}).get("duration", {})
+        rate = {"great": "good", "okay": "watch", "poor": "off"}.get(dur.get("label"), "watch")
+        items.append({"name": "Sleep duration", "rating": rate,
+                      "plain": f"You average {sm.get('avg_hours')}h/night (7–9h is the target)."})
+    good = [i for i in items if i["rating"] == "good"]
+    watch = [i for i in items if i["rating"] == "watch"]
+    off = [i for i in items if i["rating"] == "off"]
+    if off:
+        level, color = "Worth attention", "bad"
+        verb = "is" if len(off) == 1 else "are"
+        headline = f"Most signals look fine, but your {', '.join(i['name'] for i in off)} {verb} well outside your normal range — worth a closer look."
+    elif watch:
+        level, color = "Mostly good", "watch"
+        headline = f"Solid overall — {len(good)} of your {len(items)} core signals are healthy. A couple ({', '.join(i['name'] for i in watch)}) are drifting a little."
+    else:
+        level, color = "Strong", "good"
+        headline = "All your core health signals are in a healthy range right now — nice work."
+    reasons = [{"name": i["name"], "reasons": REASONS.get(i["name"], [])}
+               for i in (off + watch) if REASONS.get(i["name"])]
+    return {"have_data": bool(items), "level": level, "color": color, "headline": headline,
+            "good": [i["name"] for i in good], "watch": [i["name"] for i in watch],
+            "off": [i["name"] for i in off], "reasons": reasons,
+            "disclaimer": "A plain-language read of your data — not a medical diagnosis. See a clinician for anything concerning."}
+
+
+def period_summary(uid):
+    fr = feature_frame(uid)
+    if len(fr) < 7:
+        return {"enough": False}
+    KEYS = [("recovery", "Recovery", "%", True), ("hrv", "HRV", "ms", True), ("rhr", "Resting HR", "bpm", False),
+            ("sleep_hours", "Sleep", "h", True), ("sleep_quality", "Sleep quality", "", True),
+            ("strain", "Strain", "", None)]
+    rows, wins, losses = [], [], []
+    for key, label, unit, hb in KEYS:
+        vals = [r[key] for r in fr if r[key] is not None]
+        if len(vals) < 7:
+            continue
+        a7 = statistics.fmean(vals[-7:])
+        a30 = statistics.fmean(vals[-30:]) if len(vals) >= 8 else a7
+        delta = a7 - a30
+        if hb is None:
+            direction = "steady"
+        elif abs(delta) < (a30 * 0.03):
+            direction = "steady"
+        else:
+            improving = (delta > 0) == hb
+            direction = "improving" if improving else "declining"
+            (wins if improving else losses).append(label)
+        rows.append({"metric": label, "unit": unit, "avg7": round(a7, 1), "avg30": round(a30, 1),
+                     "delta": round(delta, 1), "direction": direction, "higher_better": hb})
+    bits = []
+    if wins:
+        bits.append("up vs your monthly average: " + ", ".join(wins))
+    if losses:
+        bits.append("down a bit: " + ", ".join(losses))
+    narrative = ("This week " + "; ".join(bits) + ".") if bits else "This week is right in line with your monthly averages — steady and consistent."
+    return {"enough": True, "rows": rows, "narrative": narrative}
+
+
 # ============================================================ WEB APP
 app = FastAPI(title="WHOOP Circle")
 
@@ -1664,7 +1744,8 @@ def api_dashboard(request: Request):
             "vitals": vitals_panel(uid)["vitals"], "load": load_acwr(uid),
             "sleep": sleep_medicine(uid), "overview": overview(uid),
             "narrative": weekly_narrative(uid)["narrative"],
-            "recovery_series": rc["series"][-30:], "population": population_compare(uid)}
+            "recovery_series": rc["series"][-30:], "population": population_compare(uid),
+            "overall": overall_health(uid)}
 
 
 @app.get("/api/sleep")
@@ -1715,6 +1796,16 @@ def api_peptide_outcomes(request: Request):
 @app.get("/api/health/narrative")
 def api_narrative(request: Request):
     return weekly_narrative(require(request))
+
+
+@app.get("/api/health/summary")
+def api_summary(request: Request):
+    return overall_health(require(request))
+
+
+@app.get("/api/insights/summary")
+def api_insights_summary(request: Request):
+    return period_summary(require(request))
 
 
 @app.get("/api/insights/drivers")
@@ -2086,6 +2177,7 @@ a{color:var(--accent2)}
 <div class="panel"><h3>Sleep</h3><div id="dSleep"></div></div>
 <div class="panel"><h3>Latest</h3><div id="dLatest"></div></div>
 </div>
+<div class="panel" style="margin-top:15px"><h3>Your overall health picture</h3><div id="dOverall"></div></div>
 <div class="panel" style="margin-top:15px"><h3>Vitals snapshot</h3><div class="muted small" style="margin:-6px 0 10px">Your key body signals vs <i>your own</i> normal. Green dot = healthy · amber = keep an eye · red = off.</div><div class="grid cards" id="dVitals"></div></div>
 <div class="grid g2" style="margin-top:15px">
 <div class="panel"><h3>Recovery &amp; strain — last 30</h3><div class="muted small" style="margin:-6px 0 6px">Green = how recovered you are · Orange = how hard you pushed that day.</div><div class="ch"><canvas id="dChart"></canvas></div></div>
@@ -2133,6 +2225,7 @@ a{color:var(--accent2)}
 </section>
 
 <section id="tab-insights" class="hidden">
+<div class="panel" style="margin-bottom:15px"><h3>Last 7 days vs last 30 days</h3><div id="iSummary"></div></div>
 <div class="grid g2">
 <div class="panel"><h3>What drives your recovery</h3><div class="ch"><canvas id="iDrivers"></canvas></div><div class="small muted" style="margin-top:6px">Correlation of each factor with next-day recovery (−1 to +1).</div></div>
 <div class="panel"><h3>Forecast — tomorrow's recovery</h3><div id="iForecast"></div></div>
@@ -2301,7 +2394,20 @@ async function loadDashboard(){
  const s=d.recovery_series,labels=s.map(p=>p.day);
  mkChart('dChart','line',{labels,datasets:[{label:'Recovery %',data:s.map(p=>p.recovery),borderColor:'#16e0a3',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Strain',data:s.map(p=>p.strain),borderColor:'#ff8a3a',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:100},y1:{position:'right',min:0,max:21,grid:{drawOnChartArea:false}}}});
  $('#dNarr').innerHTML=d.narrative;
+ $('#dOverall').innerHTML=overallHtml(d.overall);
  $('#dCompare').innerHTML=compareHtml(d.population);}
+function overallHtml(o){if(!o||!o.have_data)return '<span class="muted small">Sync your WHOOP to see your summary.</span>';
+ const c={good:'#16e0a3',watch:'#ffb020',bad:'#ff4d5e'}[o.color];
+ let h='<span class="badge" style="background:'+c+'22;color:'+c+';font-size:14px;font-weight:800">'+o.level+'</span>';
+ h+='<div style="font-size:15.5px;line-height:1.6;margin:10px 0">'+o.headline+'</div>';
+ if(o.good.length)h+='<div class="small" style="margin-bottom:3px"><span style="color:var(--green)">●</span> Healthy: '+o.good.join(', ')+'</div>';
+ if(o.watch.length)h+='<div class="small" style="margin-bottom:3px"><span style="color:var(--amber)">●</span> Keep an eye on: '+o.watch.join(', ')+'</div>';
+ if(o.off.length)h+='<div class="small" style="margin-bottom:3px"><span style="color:var(--red)">●</span> Off: '+o.off.join(', ')+'</div>';
+ if(o.reasons.length)h+='<div style="margin-top:12px"><div class="lbl">If something\'s off, common reasons</div>'+o.reasons.map(r=>'<div class="small" style="margin-top:5px"><b>'+r.name+':</b> <span class="muted">'+r.reasons.join(' · ')+'</span></div>').join('')+'</div>';
+ return h+'<div class="muted small" style="margin-top:12px">'+o.disclaimer+'</div>';}
+function summaryHtml(s){if(!s||!s.enough)return '<span class="muted small">Need at least a week of data.</span>';
+ return '<div style="font-size:15.5px;line-height:1.6;margin-bottom:12px">'+s.narrative+'</div><div class="grid cards">'+s.rows.map(r=>{const dc=r.direction==='improving'?'#16e0a3':r.direction==='declining'?'#ff4d5e':'#7d8b9a';const ar=r.direction==='improving'?'▲':r.direction==='declining'?'▼':'—';
+  return '<div class="panel" style="padding:12px"><div class="lbl">'+r.metric+'</div><div class="v" style="font-size:22px">'+r.avg7+(r.unit?' '+r.unit:'')+'</div><div class="small muted">last 7 days</div><div class="small" style="margin-top:4px">30-day avg '+r.avg30+(r.unit?' '+r.unit:'')+' · <span style="color:'+dc+'">'+ar+' '+r.direction+'</span></div></div>';}).join('')+'</div>';}
 function compareHtml(pop){if(!pop||!pop.have_profile)return '<span class="muted small">Set your <b>age &amp; sex</b> in Settings to see how you stack up against the average person your age.</span>';
  return '<div class="muted small" style="margin-bottom:10px">'+pop.note+'</div><div class="grid g2">'+pop.rows.map(r=>{const col=r.status==='better'?'#16e0a3':r.status==='below'?'#ff4d5e':'#ffb020';const mx=(Math.max(r.you,r.avg)*1.3)||1;
   return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;justify-content:space-between;align-items:center"><b>'+r.metric+'</b><span class="badge" style="background:'+col+'22;color:'+col+'">'+r.status+'</span></div>'+
@@ -2354,7 +2460,8 @@ async function loadLoad(){const[ld,rc,wo]=await Promise.all([api('/api/health/lo
  mkChart('lSports','bar',{labels:wo.sports.map(s=>s.sport),datasets:[{label:'Sessions',data:wo.sports.map(s=>s.count),backgroundColor:'#38bdf8'},{label:'Avg strain',data:wo.sports.map(s=>s.avg_strain),backgroundColor:'#00e5a0'}]});}
 
 /* ---------- INSIGHTS ---------- */
-async function loadInsights(){const[dr,fc,wy,tr,an]=await Promise.all([api('/api/insights/drivers'),api('/api/insights/forecast'),api('/api/insights/why'),api('/api/insights/trends'),api('/api/insights/anomalies')]);
+async function loadInsights(){const[dr,fc,wy,tr,an,su]=await Promise.all([api('/api/insights/drivers'),api('/api/insights/forecast'),api('/api/insights/why'),api('/api/insights/trends'),api('/api/insights/anomalies'),api('/api/insights/summary')]);
+ $('#iSummary').innerHTML=summaryHtml(su);
  const d=dr.drivers.filter(x=>x.r!=null).slice(0,7);
  mkChart('iDrivers','bar',{labels:d.map(x=>x.factor),datasets:[{label:'Correlation with recovery',data:d.map(x=>x.r),backgroundColor:d.map(x=>x.r>0?'#00e5a0':'#ff4d5e')}]},{indexAxis:'y',scales:{x:{min:-1,max:1}}});
  if(fc.has_data){$('#iForecast').innerHTML='<div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap"><div style="text-align:center">'+ring(fc.predicted_recovery,bandColor(fc.predicted_recovery>=67?'prime':fc.predicted_recovery>=34?'moderate':'recover'),'pred',130)+'<div class="muted small">likely '+fc.range[0]+'–'+fc.range[1]+'%</div></div><div style="flex:1"><div class="lbl">Contributors</div>'+fc.contributors.map(c=>'<div style="margin:4px 0">'+c.factor+' <b class="'+(c.effect>0?'pos':'neg')+'">'+(c.effect>0?'+':'')+c.effect+'</b></div>').join('')+'<div class="muted small" style="margin-top:8px">Illness risk: '+fc.illness_risk+' ('+fc.illness_conf+'%)</div></div></div><div class="muted small" style="margin-top:8px">'+fc.note+'</div>';}
