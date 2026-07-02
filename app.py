@@ -1923,6 +1923,7 @@ a{color:var(--accent2)}
 .hmtrack{flex:1;height:11px;border-radius:4px;background:var(--panel2);position:relative}
 .hmbar{position:absolute;top:0;bottom:0;background:linear-gradient(90deg,var(--violet),var(--accent2));border-radius:4px;opacity:.85}
 #bar{position:fixed;top:0;left:0;height:3px;width:0;opacity:0;background:linear-gradient(90deg,var(--accent2),var(--accent));z-index:99;transition:width .3s ease,opacity .3s ease;box-shadow:0 0 8px var(--accent)}
+.ch{position:relative;width:100%;height:200px;margin-top:8px}.ch canvas{position:absolute!important;inset:0;width:100%!important;height:100%!important}
 .tl{border-left:2px solid var(--line);margin-left:6px;padding-left:14px}
 .tlrow{position:relative;padding:7px 0;font-size:13.5px}
 .tlrow:before{content:'';position:absolute;left:-21px;top:12px;width:9px;height:9px;border-radius:50%;background:var(--accent2)}
@@ -1972,7 +1973,7 @@ a{color:var(--accent2)}
 </div>
 <div class="panel" style="margin-top:15px"><h3>Vitals snapshot</h3><div class="grid cards" id="dVitals"></div></div>
 <div class="grid g2" style="margin-top:15px">
-<div class="panel"><h3>Recovery &amp; strain — last 30</h3><canvas id="dChart" height="130"></canvas></div>
+<div class="panel"><h3>Recovery &amp; strain — last 30</h3><div class="ch"><canvas id="dChart"></canvas></div></div>
 <div class="panel"><h3>Your weekly read-out</h3><div id="dNarr" class="reveal" style="font-size:15px;line-height:1.7"></div>
 <div id="dStreaks" style="margin-top:12px"></div></div>
 </div>
@@ -1992,11 +1993,11 @@ a{color:var(--accent2)}
 <div class="panel"><h3>Social jetlag</h3><div id="sJet"></div></div>
 </div>
 <div class="grid g2" style="margin-top:15px">
-<div class="panel"><h3>Architecture vs clinical norms</h3><canvas id="sArch" height="150"></canvas><div id="sArchNote" class="small muted" style="margin-top:8px"></div></div>
-<div class="panel"><h3>Stage mix</h3><canvas id="sStage" height="150"></canvas></div>
+<div class="panel"><h3>Architecture vs clinical norms</h3><div class="ch"><canvas id="sArch"></canvas></div><div id="sArchNote" class="small muted" style="margin-top:8px"></div></div>
+<div class="panel"><h3>Stage mix</h3><div class="ch"><canvas id="sStage"></canvas></div></div>
 </div>
 <div class="panel" style="margin-top:15px"><h3>Bedtime &amp; wake heatmap (last 30 nights)</h3><div id="sHeat"></div><div class="small muted" style="margin-top:6px">Each bar = time asleep across a 24h day (6pm → 6pm). Tight alignment = strong circadian rhythm.</div></div>
-<div class="panel" style="margin-top:15px"><h3>Sleep quality trend</h3><canvas id="sTrend" height="90"></canvas></div>
+<div class="panel" style="margin-top:15px"><h3>Sleep quality trend</h3><div class="ch"><canvas id="sTrend"></canvas></div></div>
 </section>
 
 <section id="tab-load" class="hidden">
@@ -2006,17 +2007,17 @@ a{color:var(--accent2)}
 <div class="panel"><h3>Chronic (28d)</h3><div id="lChronic"></div></div>
 <div class="panel"><h3>Monotony</h3><div id="lMono"></div></div>
 </div>
-<div class="panel" style="margin-top:15px"><h3>Strain &amp; workload ratio</h3><canvas id="lChart" height="95"></canvas></div>
+<div class="panel" style="margin-top:15px"><h3>Strain &amp; workload ratio</h3><div class="ch"><canvas id="lChart"></canvas></div></div>
 <div class="grid g2" style="margin-top:15px">
-<div class="panel"><h3>Recovery vs Strain</h3><canvas id="lRec" height="120"></canvas></div>
-<div class="panel"><h3>HR-zone distribution</h3><canvas id="lZones" height="120"></canvas></div>
+<div class="panel"><h3>Recovery vs Strain</h3><div class="ch"><canvas id="lRec"></canvas></div></div>
+<div class="panel"><h3>HR-zone distribution</h3><div class="ch"><canvas id="lZones"></canvas></div></div>
 </div>
-<div class="panel" style="margin-top:15px"><h3>By sport</h3><canvas id="lSports" height="90"></canvas></div>
+<div class="panel" style="margin-top:15px"><h3>By sport</h3><div class="ch"><canvas id="lSports"></canvas></div></div>
 </section>
 
 <section id="tab-insights" class="hidden">
 <div class="grid g2">
-<div class="panel"><h3>What drives your recovery</h3><canvas id="iDrivers" height="150"></canvas><div class="small muted" style="margin-top:6px">Correlation of each factor with next-day recovery (−1 to +1).</div></div>
+<div class="panel"><h3>What drives your recovery</h3><div class="ch"><canvas id="iDrivers"></canvas></div><div class="small muted" style="margin-top:6px">Correlation of each factor with next-day recovery (−1 to +1).</div></div>
 <div class="panel"><h3>Forecast — tomorrow's recovery</h3><div id="iForecast"></div></div>
 </div>
 <div class="panel" style="margin-top:15px"><h3>Why today looks the way it does</h3><div id="iWhy"></div></div>
@@ -2029,7 +2030,7 @@ a{color:var(--accent2)}
 <div class="row"><div><label>Metric A</label><select id="eA"></select></div><div><label>Metric B</label><select id="eB"></select></div>
 <div><label>Days</label><select id="eDays"><option value="30">30</option><option value="60">60</option><option value="90" selected>90</option><option value="9999">All</option></select></div>
 <div style="flex:0;display:flex;align-items:flex-end"><button class="b g sm" onclick="location.href='/api/explore/csv'">⭳ CSV</button></div></div>
-<canvas id="eChart" height="110" style="margin-top:12px"></canvas></div>
+<div class="ch"><canvas id="eChart"></canvas></div></div>
 <div class="grid g2" style="margin-top:15px">
 <div class="panel"><h3>Goals</h3><div id="gList"></div>
 <div class="row" style="margin-top:10px"><div><label>Metric</label><select id="gMetric"></select></div><div><label>Target</label><input id="gTarget" type="number" step="0.1"></div>
@@ -2039,13 +2040,14 @@ a{color:var(--accent2)}
 <div class="row"><div><label>A from</label><input type="date" id="cAf"></div><div><label>A to</label><input type="date" id="cAt"></div></div>
 <div class="row"><div><label>B from</label><input type="date" id="cBf"></div><div><label>B to</label><input type="date" id="cBt"></div></div>
 <button class="b g sm" style="margin-top:10px" onclick="runCompare()">Compare</button>
-<canvas id="cChart" height="120" style="margin-top:12px"></canvas></div>
+<div class="ch"><canvas id="cChart"></canvas></div></div>
 </div>
 </section>
 
 <section id="tab-peptides" class="hidden">
 <div class="panel"><h3>Add a peptide</h3>
-<div class="row"><div><label>Name</label><input id="pName" placeholder="e.g. GHK-Cu"></div><div><label>Dose</label><input id="pDose" placeholder="e.g. 2mg"></div></div>
+<div class="row"><div><label>Name</label><input id="pName" placeholder="e.g. GHK-Cu" oninput="onPepName()" autocomplete="off"></div><div><label>Dose</label><input id="pDose" placeholder="e.g. 2mg"></div></div>
+<div id="pRec"></div>
 <label>Days of the week</label><div id="pDays"></div>
 <div style="margin-top:10px"><button class="b p" onclick="addPeptide()">Add peptide</button></div></div>
 <div class="panel"><h3>My peptides</h3><div id="pVials" class="grid cards"></div></div>
@@ -2119,7 +2121,18 @@ function refbar(low,high,latest){const pad=(high-low)||1,min=low-pad,max=high+pa
 function pctbar(p){return'<div class="pctbar"><div class="pctfill" style="width:'+(p||0)+'%"></div></div>';}
 /* peptide catalog: name -> [use, liquid tint] */
 const PEPTINFO={'BPC-157':['tissue repair / gut','#bcdcff'],'TB-500':['recovery / healing','#d3c8ff'],'GHK-Cu':['skin / collagen','#5fc9c0'],'Ipamorelin':['GH secretagogue','#e4d8ff'],'CJC-1295':['GH secretagogue','#c7e2ff'],'Sermorelin':['GH / sleep','#d2efe4'],'Tesamorelin':['fat loss / GH','#c7e2ff'],'GHRP-2':['GH / appetite','#e4d8ff'],'GHRP-6':['GH / appetite','#e6dcff'],'Hexarelin':['GH pulse','#d7e6ff'],'MK-677':['oral GH / sleep','#ffdfae'],'IGF-1 LR3':['growth / recovery','#c7e2ff'],'Melanotan II':['tan / libido','#e6bf94'],'Melanotan I':['tan','#edcfa2'],'PT-141':['libido','#f5c2d3'],'Semaglutide':['GLP-1 / weight','#dce9ff'],'Tirzepatide':['GLP-1/GIP / weight','#dce9ff'],'Retatrutide':['triple-G / weight','#dce9ff'],'AOD-9604':['fat loss','#d2efe4'],'Epitalon':['longevity / sleep','#e3d7ff']};
-function pepTint(name){const k=Object.keys(PEPTINFO).find(x=>name&&name.toLowerCase().replace(/[^a-z0-9]/g,'').startsWith(x.toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,4)));return k?PEPTINFO[k][1]:'#8be3c9';}
+const _norm=s=>(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+function matchPep(name){const n=_norm(name);if(n.length<2)return null;return Object.keys(PEPTINFO).find(k=>{const kk=_norm(k);return kk.startsWith(n)||n.startsWith(kk)||(n.length>=3&&kk.includes(n));})||null;}
+function pepTint(name){const k=matchPep(name);return k?PEPTINFO[k][1]:'#8be3c9';}
+/* suggested weekly schedule (schedule pattern only, NOT dosing advice) */
+const DAILY=[0,1,2,3,4,5,6];
+const PEPSUGGEST={'Semaglutide':[[0],'typically once weekly'],'Tirzepatide':[[0],'typically once weekly'],'Retatrutide':[[0],'typically once weekly'],'PT-141':[[],'used as-needed'],'Melanotan I':[[0,2,4],'often a few days/week'],'Hexarelin':[[0,1,2,3,4],'often 5 days/week']};
+function pepSuggest(k){return PEPSUGGEST[k]||[DAILY,'commonly run daily'];}
+function onPepName(){const q=$('#pName').value;const k=matchPep(q);const box=$('#pRec');if(!box)return;
+ if(!k){box.innerHTML='';return;}
+ const info=PEPTINFO[k],sug=pepSuggest(k);
+ box.innerHTML='<div class="panel" style="background:var(--panel2);display:flex;gap:14px;align-items:center;margin-top:8px"><div style="width:64px;flex:0 0 64px">'+vial(k,0.7,'#16e0a3',info[1])+'</div><div style="flex:1"><b>'+k+'</b> <span class="muted small">'+info[0]+'</span><div class="small" style="margin-top:3px">Suggested schedule: <b>'+sug[1]+'</b></div><div style="margin-top:6px"><button class="b g sm" onclick="applySuggest(\''+k+'\')">Use suggested days</button> <span class="muted small">schedule only — not medical advice</span></div></div></div>';}
+function applySuggest(k){pickedDays=new Set(pepSuggest(k)[0]);renderDayPicker();}
 function vial(name,fill,glow,tint){fill=Math.max(0,Math.min(1,fill||0));tint=tint||'#8be3c9';glow=glow||'#16e0a3';
  const innerTop=58,liqBottom=190,top=44,level=innerTop+(1-fill)*(liqBottom-innerTop),u=Math.random().toString(36).slice(2,7);
  let fs=13;if(name&&name.length>10)fs=11;if(name&&name.length>13)fs=9.5;
@@ -2242,7 +2255,7 @@ function tglDay(i){pickedDays.has(i)?pickedDays.delete(i):pickedDays.add(i);rend
 function mondayOf(d){const x=new Date(d);const day=(x.getDay()+6)%7;x.setDate(x.getDate()-day);return x.toISOString().slice(0,10);}
 function dateOfWeek(i){const d=new Date(pWeek);d.setDate(d.getDate()+i);return d.toISOString().slice(0,10);}
 function shiftWeek(n){const d=new Date(pWeek);d.setDate(d.getDate()+n*7);pWeek=mondayOf(d);loadPeptides();}
-async function addPeptide(){const name=$('#pName').value.trim();if(!name){alert('Name?');return;}await fetch('/api/peptides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,dose:$('#pDose').value.trim(),days:[...pickedDays].sort()})});$('#pName').value='';$('#pDose').value='';loadPeptides();}
+async function addPeptide(){const name=$('#pName').value.trim();if(!name){alert('Name?');return;}await fetch('/api/peptides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,dose:$('#pDose').value.trim(),days:[...pickedDays].sort()})});$('#pName').value='';$('#pDose').value='';$('#pRec').innerHTML='';loadPeptides();}
 async function delPeptide(pid){if(!confirm('Delete this peptide and its history?'))return;await fetch('/api/peptides/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid})});loadPeptides();}
 async function togglePep(pid,ds,cur){await fetch('/api/peptides/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid,day:ds,taken:!cur})});loadPeptides();}
 async function saveNote(pid){await fetch('/api/peptides/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({peptide_id:pid,week_start:pWeek,note:document.getElementById('note-'+pid).value})});const m=document.getElementById('nmsg-'+pid);if(m){m.textContent='saved ✓';setTimeout(()=>m.textContent='',1200);}}
@@ -2309,7 +2322,8 @@ function loadSettings(){$('#setName').value=me?me.name:'';}
 async function saveName(){const n=$('#setName').value.trim();if(!n)return;await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_name:n})});me.name=n;$('#sideName').textContent=n;$('#setMsg').textContent='Saved ✓';setTimeout(()=>$('#setMsg').textContent='',1500);}
 
 function mkChart(id,type,data,opts){opts=opts||{};const el=$('#'+id);if(!el)return;if(charts[id])charts[id].destroy();
- charts[id]=new Chart(el,{type,data,options:{responsive:true,maintainAspectRatio:false,plugins:Object.assign({legend:{labels:{color:'#7d8b9a',boxWidth:12}}},opts.plugins||{}),indexAxis:opts.indexAxis||'x',scales:opts.scales?Object.fromEntries(Object.entries(opts.scales).map(([k,v])=>[k,Object.assign({},v,{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}})])):(type==='doughnut'||type==='polarArea'?{}:{x:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}},y:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}}})}});}
+ charts[id]=new Chart(el,{type,data,options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},plugins:Object.assign({legend:{labels:{color:'#7d8b9a',boxWidth:12}}},opts.plugins||{}),indexAxis:opts.indexAxis||'x',scales:opts.scales?Object.fromEntries(Object.entries(opts.scales).map(([k,v])=>[k,Object.assign({},v,{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}})])):(type==='doughnut'||type==='polarArea'?{}:{x:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}},y:{ticks:{color:'#7d8b9a'},grid:{color:'#18202a'}}})}});
+ requestAnimationFrame(()=>{try{charts[id].resize();}catch(e){}});}
 boot();
 </script></body></html>
 """
