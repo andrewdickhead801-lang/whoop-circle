@@ -1035,6 +1035,17 @@ def sleep_medicine(uid):
     reg = sleep_regularity(uid)
     avg_h = _round(_mean([s["hours"] for s in sleeps[-30:]]))
     debt = sleep_debt(uid)
+
+    # today / 7-day / 30-day windows for each sleep metric
+    def _w3(vals):
+        v = [x for x in vals if x is not None]
+        if not v:
+            return {"d1": None, "d7": None, "d30": None}
+        return {"d1": _round(v[-1]), "d7": _round(_mean(v[-7:])), "d30": _round(_mean(v[-30:]))}
+    dur_trio = _w3([s["hours"] for s in sleeps]); dur_trio["unit"] = "h"
+    spo2_trio = _w3([r["spo2_pct"] for r in _recs(uid)]); spo2_trio["unit"] = "%"
+    reg_trio = {"d1": None, "d7": sleep_regularity(uid, 7), "d30": sleep_regularity(uid, 30), "unit": ""}
+    debt_trio = {"d1": sleep_debt(uid, 1), "d7": sleep_debt(uid, 7), "d30": sleep_debt(uid, 30), "unit": "h"}
     for a in arch:
         a["plain"] = {"optimal": "healthy amount", "watch": "a little off the ideal range",
                       "flag": "outside the healthy range"}[a["status"]]
@@ -1052,15 +1063,15 @@ def sleep_medicine(uid):
     reg_risk = "concern" if (reg is not None and reg < 50) else ("watch" if (reg is not None and reg < 70) else "ok")
     debt_risk = "concern" if (debt is not None and debt >= 10) else ("watch" if (debt is not None and debt >= 6) else "ok")
     plains = {
-        "regularity": {"label": reg_r[0], "color": reg_r[1], "risk": reg_risk,
+        "regularity": {"label": reg_r[0], "color": reg_r[1], "risk": reg_risk, "trio": reg_trio,
                        "text": "how consistent your sleep/wake times are. 85+ is excellent; under 50 means very irregular timing.",
                        "why": "An irregular body clock is linked to worse recovery, mood and even long-term metabolic health.",
                        "causes": "changing bedtimes, late weekends, shift work, travel, or screens late at night",
                        "danger": "Not dangerous short-term, but a chronically irregular schedule is worth fixing." if reg_risk != "ok" else "Healthy, consistent timing."},
-        "duration": {"label": dur_r[0], "color": dur_r[1], "risk": dur_risk.get("level", "ok"),
+        "duration": {"label": dur_r[0], "color": dur_r[1], "risk": dur_risk.get("level", "ok"), "trio": dur_trio,
                      "text": f"you average {avg_h}h/night. 7–9h is the healthy target for adults.",
                      "why": dur_risk.get("why", ""), "causes": dur_risk.get("causes", ""), "danger": dur_risk.get("note", "")},
-        "debt": {"label": debt_r[0], "color": debt_r[1], "risk": debt_risk,
+        "debt": {"label": debt_r[0], "color": debt_r[1], "risk": debt_risk, "trio": debt_trio,
                  "text": "sleep you owe from short nights this week. Under 3h is great; over 6h means you're running low.",
                  "why": "Big sleep debt lowers recovery, focus and immunity until you pay it back.",
                  "causes": "a run of short nights — late bedtimes, early alarms, or disrupted sleep",
@@ -1072,7 +1083,7 @@ def sleep_medicine(uid):
             "spo2": _round(spo2), "disturbances": _round(dist), "respiratory_rate": _round(rr),
             "breathing_flags": flags, "plains": plains,
             "breathing": {"risk": breathe_risk.get("level", "ok"), "note": breathe_risk.get("note", ""),
-                          "causes": breathe_risk.get("causes", ""), "why": breathe_risk.get("why", "")}}
+                          "causes": breathe_risk.get("causes", ""), "why": breathe_risk.get("why", ""), "trio": spo2_trio}}
 
 
 def peptide_outcomes(uid, before_days=21):
@@ -2478,8 +2489,8 @@ function summaryHtml(s){if(!s||!s.enough)return '<span class="muted small">Need 
  return '<div style="font-size:15.5px;line-height:1.6;margin-bottom:12px">'+s.narrative+'</div><div class="grid cards">'+s.rows.map(r=>{const dc=r.direction==='improving'?'#16e0a3':r.direction==='declining'?'#ff4d5e':'#7d8b9a';const ar=r.direction==='improving'?'▲':r.direction==='declining'?'▼':'—';
   return '<div class="panel" style="padding:12px"><div class="lbl">'+r.metric+'</div><div class="v" style="font-size:22px">'+r.avg7+(r.unit?' '+r.unit:'')+'</div><div class="small muted">last 7 days</div><div class="small" style="margin-top:4px">30-day avg '+r.avg30+(r.unit?' '+r.unit:'')+' · <span style="color:'+dc+'">'+ar+' '+r.direction+'</span></div></div>';}).join('')+'</div>';}
 const RISKMAP={ok:['#16e0a3','✓ Healthy — no concern'],watch:['#ffb020','⚠ Keep an eye on it'],concern:['#ff4d5e','⚑ Pay attention to this']};
-function trioHtml(r){const cells=[['Today',r.d1],['7-day avg',r.d7],['30-day avg',r.d30]];
- return '<div style="display:flex;gap:6px;margin:8px 0">'+cells.map(c=>'<div style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 2px;text-align:center"><div style="font-size:16px;font-weight:800">'+(c[1]==null?'—':c[1])+'</div><div style="font-size:9px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);margin-top:1px">'+c[0]+'</div></div>').join('')+'</div>';}
+function trioHtml(r){const u=r.unit?' '+r.unit:'';const cells=[['Today',r.d1],['7-day avg',r.d7],['30-day avg',r.d30]];
+ return '<div style="display:flex;gap:6px;margin:8px 0">'+cells.map(c=>'<div style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 2px;text-align:center"><div style="font-size:16px;font-weight:800">'+(c[1]==null?'—':c[1]+u)+'</div><div style="font-size:9px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);margin-top:1px">'+c[0]+'</div></div>').join('')+'</div>';}
 function riskBox(r){const rk=RISKMAP[r.risk]||RISKMAP.ok;const isok=(r.risk||'ok')==='ok';
  return '<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:9px;background:'+rk[0]+(isok?'14':'10')+';border-radius:9px;padding:9px;border:1px solid '+rk[0]+'33">'+
   '<span class="badge" style="background:'+rk[0]+'2e;color:'+rk[0]+';font-size:13px;font-weight:800;padding:3px 12px">'+rk[1]+'</span>'+
@@ -2514,9 +2525,9 @@ async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/
   $('#sDur').innerHTML='<div class="big">'+fmt(sm.avg_hours)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">per night</div><div style="margin-top:5px">'+rateChip(pl.duration)+'</div>'+rateNote(pl.duration);
   $('#sJet').innerHTML='<div class="big">'+fmt(cir.social_jetlag_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">weekend shift</div><div class="muted small" style="margin-top:5px">difference in your sleep timing on weekends vs weekdays. Under 1h is good.</div>';
   const srItems=[['Sleep duration',pl.duration],['Sleep regularity',pl.regularity],['Sleep debt',pl.debt]];
-  if(sm.breathing&&(sm.breathing.risk!=='ok'||sm.spo2!=null))srItems.push(['Breathing / blood oxygen',{risk:sm.breathing.risk,danger:sm.breathing.note,why:sm.breathing.why,causes:sm.breathing.causes}]);
+  if(sm.breathing&&(sm.breathing.risk!=='ok'||sm.spo2!=null))srItems.push(['Breathing / blood oxygen',{risk:sm.breathing.risk,danger:sm.breathing.note,why:sm.breathing.why,causes:sm.breathing.causes,trio:sm.breathing.trio}]);
   $('#sRisk').innerHTML='<div class="grid g2">'+srItems.map(([name,p])=>{if(!p)return'';
-   return '<div class="panel" style="background:var(--panel2);padding:14px"><b>'+name+'</b>'+riskBox({risk:p.risk||'ok',risk_note:p.danger,why:p.why,causes:p.causes})+'</div>';}).join('')+'</div><div class="muted small" style="margin-top:8px">Plain-language read of your data — not a medical diagnosis.</div>';
+   return '<div class="panel" style="background:var(--panel2);padding:14px"><b>'+name+'</b>'+(p.trio?trioHtml(p.trio):'')+riskBox({risk:p.risk||'ok',risk_note:p.danger,why:p.why,causes:p.causes})+'</div>';}).join('')+'</div><div class="muted small" style="margin-top:8px">Plain-language read of your data — not a medical diagnosis.</div>';
   const stHex={optimal:'#16e0a3',watch:'#ffb020',flag:'#ff4d5e'};const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stHex[x.status]||'#7d8b9a')},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
   $('#sArchNote').innerHTML='<div class="muted small" style="margin-bottom:4px">How your night splits into sleep stages vs the clinical healthy range. Deep = physical recovery, REM = mental recovery.</div>'+a.map(x=>'<div class="small"><span class="dot d-'+x.status+'"></span><b>'+x.stage+'</b> '+x.pct+'% <span class="muted">(healthy '+x.norm+') — '+x.plain+'</span></div>').join('');
   mkChart('sStage','doughnut',{labels:['Light','REM','Deep'],datasets:[{data:[a.find(x=>x.stage=='Light').pct,a.find(x=>x.stage=='REM').pct,a.find(x=>x.stage=='Deep').pct],backgroundColor:['#38bdf8','#a78bfa','#00e5a0']}]},{plugins:{legend:{position:'bottom'}}});
