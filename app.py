@@ -1548,17 +1548,17 @@ def metric_risk(key, v):
                 "why": "HRV shows how well your nervous system bounces back; higher means better recovery."}
     if key == "rhr":
         lvl = "concern" if v > 100 else ("watch" if v >= 90 else "ok")
-        note = {"concern": "A resting heart rate over 100 bpm (tachycardia) is worth discussing with a doctor, especially if you get palpitations, dizziness or breathlessness.",
+        note = {"concern": "A resting heart rate over 100 bpm at rest is on the high side — pay attention to it. If it stays high or comes with palpitations or dizziness, it's worth mentioning to a doctor.",
                 "watch": "A little elevated — usually stress, caffeine or fitness related. Worth keeping an eye on.",
-                "ok": "Sits in the healthy range — no concern."}[lvl]
+                "ok": "Sits in the healthy range — nothing to worry about."}[lvl]
         return {"level": lvl, "note": note,
                 "causes": "stress, dehydration, caffeine, alcohol, illness, poor sleep, or lower fitness",
                 "why": "Resting heart rate reflects how hard your heart works at rest — lower is generally fitter."}
     if key == "resp":
         lvl = "concern" if v > 20 else ("watch" if v >= 18 else "ok")
-        note = {"concern": "Consistently over 20 breaths/min can point to a chest infection or breathing issue — worth checking with a doctor if it persists or you feel unwell.",
+        note = {"concern": "Consistently over 20 breaths/min is worth paying attention to — it's often an early sign of illness. Rest up; if it persists or you feel unwell, mention it to a doctor.",
                 "watch": "Slightly high — often an early sign of illness or stress.",
-                "ok": "In the healthy range — no concern."}[lvl]
+                "ok": "In the healthy range — nothing to worry about."}[lvl]
         return {"level": lvl, "note": note,
                 "causes": "an oncoming illness or fever, stress, alcohol, or a warm/stuffy room",
                 "why": "Breathing rate during sleep is normally very steady, so a rise often shows up before you feel sick."}
@@ -1572,9 +1572,9 @@ def metric_risk(key, v):
                 "why": "Adults need 7–9h — sleep is when your body repairs and your brain consolidates."}
     if key == "spo2":
         lvl = "concern" if v < 90 else ("watch" if v < 95 else "ok")
-        note = {"concern": "Below 90% overnight is worth raising with a doctor — it can relate to disrupted breathing such as sleep apnea.",
+        note = {"concern": "Below 90% overnight is worth paying attention to — if it keeps happening it's worth mentioning to a doctor, as it can relate to disrupted breathing such as sleep apnea.",
                 "watch": "Slightly below the 95–100% norm — keep an eye on it.",
-                "ok": "In the normal 95–100% range."}[lvl]
+                "ok": "In the normal 95–100% range — nothing to worry about."}[lvl]
         return {"level": lvl, "note": note,
                 "causes": "disrupted breathing / sleep apnea, congestion or illness, or high altitude",
                 "why": "Blood oxygen shows how well you're oxygenating overnight; 95–100% is normal."}
@@ -1586,10 +1586,16 @@ def population_compare(uid):
     age, sex = u.get("age"), u.get("sex")
     if not age or not sex:
         return {"have_profile": False}
-    recs, sleeps = _recs(uid)[-30:], _sleeps(uid)[-30:]
-    you = {"hrv": _mean([r["hrv_rmssd_ms"] for r in recs]), "rhr": _mean([r["resting_hr"] for r in recs]),
-           "sleep_hours": _mean([s["hours"] for s in sleeps]), "resp": _mean([s["respiratory_rate"] for s in sleeps]),
-           "spo2": _mean([r["spo2_pct"] for r in recs])}
+    recs, sleeps = _recs(uid), _sleeps(uid)
+    SER = {"hrv": [r["hrv_rmssd_ms"] for r in recs], "rhr": [r["resting_hr"] for r in recs],
+           "sleep_hours": [s["hours"] for s in sleeps], "resp": [s["respiratory_rate"] for s in sleeps],
+           "spo2": [r["spo2_pct"] for r in recs]}
+
+    def _win(vals):
+        v = [x for x in vals if x is not None]
+        if not v:
+            return (None, None, None)
+        return (v[-1], _mean(v[-7:]), _mean(v[-30:]))
     nv = norm_values(age, sex)
     META = {
         "hrv": ("HRV", "ms", True, "how recovered your nervous system is — higher means better recovery"),
@@ -1601,16 +1607,18 @@ def population_compare(uid):
     sexword = "women" if sex.lower().startswith("f") else "men"
     rows = []
     for k, (label, unit, hb, explain) in META.items():
-        yv, avg = you[k], nv[k]
+        d1, d7, d30 = _win(SER[k])
+        yv, avg = d7, nv[k]
         if yv is None:
             continue
         better = (yv > avg) if hb else (yv < avg)
         pct = round((yv - avg) / avg * 100) if avg else 0
         status = "typical" if abs(pct) < 6 else ("better" if better else "below")
         word = {"better": "better than average 👍", "below": "below average", "typical": "about average"}[status]
-        plain = f"Your {label} of {round(yv,1)} {unit} is {word} for {sexword} aged {age} (average is ~{avg} {unit})."
+        plain = f"Your {label} averages {round(yv,1)} {unit} over the last 7 days — {word} for {sexword} aged {age} (average is ~{avg} {unit})."
         ra = metric_risk(k, yv) or {}
         rows.append({"metric": label, "unit": unit, "you": _round(yv), "avg": avg, "status": status,
+                     "d1": _round(d1), "d7": _round(d7), "d30": _round(d30),
                      "higher_better": hb, "explain": explain, "plain": plain,
                      "risk": ra.get("level", "ok"), "risk_note": ra.get("note", ""),
                      "causes": ra.get("causes", ""), "why": ra.get("why", "")})
@@ -2469,24 +2477,31 @@ function overallHtml(o){if(!o||!o.have_data)return '<span class="muted small">Sy
 function summaryHtml(s){if(!s||!s.enough)return '<span class="muted small">Need at least a week of data.</span>';
  return '<div style="font-size:15.5px;line-height:1.6;margin-bottom:12px">'+s.narrative+'</div><div class="grid cards">'+s.rows.map(r=>{const dc=r.direction==='improving'?'#16e0a3':r.direction==='declining'?'#ff4d5e':'#7d8b9a';const ar=r.direction==='improving'?'▲':r.direction==='declining'?'▼':'—';
   return '<div class="panel" style="padding:12px"><div class="lbl">'+r.metric+'</div><div class="v" style="font-size:22px">'+r.avg7+(r.unit?' '+r.unit:'')+'</div><div class="small muted">last 7 days</div><div class="small" style="margin-top:4px">30-day avg '+r.avg30+(r.unit?' '+r.unit:'')+' · <span style="color:'+dc+'">'+ar+' '+r.direction+'</span></div></div>';}).join('')+'</div>';}
-const RISKMAP={ok:['#16e0a3','✓ No concern'],watch:['#ffb020','⚠ Keep an eye on it'],concern:['#ff4d5e','⚑ Worth checking with a doctor']};
+const RISKMAP={ok:['#16e0a3','✓ Healthy — no concern'],watch:['#ffb020','⚠ Keep an eye on it'],concern:['#ff4d5e','⚑ Pay attention to this']};
+function trioHtml(r){const cells=[['Today',r.d1],['7-day avg',r.d7],['30-day avg',r.d30]];
+ return '<div style="display:flex;gap:6px;margin:8px 0">'+cells.map(c=>'<div style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 2px;text-align:center"><div style="font-size:16px;font-weight:800">'+(c[1]==null?'—':c[1])+'</div><div style="font-size:9px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);margin-top:1px">'+c[0]+'</div></div>').join('')+'</div>';}
+function riskBox(r){const rk=RISKMAP[r.risk]||RISKMAP.ok;const isok=(r.risk||'ok')==='ok';
+ return '<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:9px;background:'+rk[0]+(isok?'14':'10')+';border-radius:9px;padding:9px;border:1px solid '+rk[0]+'33">'+
+  '<span class="badge" style="background:'+rk[0]+'2e;color:'+rk[0]+';font-size:13px;font-weight:800;padding:3px 12px">'+rk[1]+'</span>'+
+  (r.risk_note?'<div class="small" style="margin-top:7px">'+r.risk_note+'</div>':'')+
+  (r.why?'<div class="muted small" style="margin-top:5px"><b>Why it matters:</b> '+r.why+'</div>':'')+
+  (r.causes?'<div class="muted small" style="margin-top:3px"><b>Common causes:</b> '+r.causes+'</div>':'')+'</div>';}
 function compareHtml(pop){if(!pop||!pop.have_profile)return '<span class="muted small">Set your <b>age &amp; sex</b> in Settings to see how you stack up against the average person your age.</span>';
- return '<div class="muted small" style="margin-bottom:10px">'+pop.note+'</div><div class="grid g2">'+pop.rows.map(r=>{const col=r.status==='better'?'#16e0a3':r.status==='below'?'#ff4d5e':'#ffb020';const mx=(Math.max(r.you,r.avg)*1.3)||1;const rk=RISKMAP[r.risk]||RISKMAP.ok;
+ return '<div class="muted small" style="margin-bottom:10px">'+pop.note+' Each card shows today, your 7-day and 30-day averages.</div><div class="grid g2">'+pop.rows.map(r=>{const col=r.status==='better'?'#16e0a3':r.status==='below'?'#ff4d5e':'#ffb020';const mx=(Math.max(r.you,r.avg)*1.3)||1;
   return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;justify-content:space-between;align-items:center"><b>'+r.metric+'</b><span class="badge" style="background:'+col+'22;color:'+col+'">'+r.status+'</span></div>'+
+   trioHtml(r)+
    '<div class="small" style="margin:6px 0">'+r.plain+'</div>'+
-   '<div style="font-size:11px;color:var(--muted)">You — '+r.you+' '+r.unit+'</div><div class="pctbar"><div class="pctfill" style="width:'+Math.min(100,r.you/mx*100)+'%;background:'+col+'"></div></div>'+
+   '<div style="font-size:11px;color:var(--muted)">You (7-day) — '+r.you+' '+r.unit+'</div><div class="pctbar"><div class="pctfill" style="width:'+Math.min(100,r.you/mx*100)+'%;background:'+col+'"></div></div>'+
    '<div style="font-size:11px;color:var(--muted);margin-top:4px">Average — '+r.avg+' '+r.unit+'</div><div class="pctbar"><div class="pctfill" style="width:'+Math.min(100,r.avg/mx*100)+'%;background:#3a4654"></div></div>'+
-   '<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px"><span class="badge" style="background:'+rk[0]+'22;color:'+rk[0]+'">'+rk[1]+'</span>'+
-   '<div class="small" style="margin-top:6px">'+r.risk_note+'</div>'+
-   '<div class="muted small" style="margin-top:5px"><b>Why it matters:</b> '+r.why+'</div>'+
-   '<div class="muted small" style="margin-top:3px"><b>Common causes:</b> '+r.causes+'</div></div></div>';}).join('')+'</div>';}
+   riskBox(r)+'</div>';}).join('')+'</div>';}
 
 /* ---------- VITALS ---------- */
 async function loadVitals(){const[vp,ew,pop]=await Promise.all([api('/api/health/vitals'),api('/api/health/early-warning'),api('/api/health/population')]);
  $('#vEw').innerHTML='<h3>Early-warning</h3>'+ewHtml(ew);
  $('#vCompare').innerHTML=compareHtml(pop);
- $('#vFull').innerHTML=vp.vitals.map((v,i)=>{const rc={good:'#16e0a3',watch:'#ffb020',off:'#ff4d5e'}[v.rating]||'#7d8b9a';
-  return '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div class="small" style="margin-top:8px"><span class="badge" style="background:'+rc+'22;color:'+rc+'">'+v.rating+'</span> '+v.plain+'</div><div class="muted small" style="margin-top:6px">your range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+'</div></div>';}).join('');}
+ const RLBL={good:'✓ Healthy',watch:'⚠ Keep an eye on it',off:'⚑ Pay attention to this'};
+ $('#vFull').innerHTML=vp.vitals.map((v,i)=>{const rc={good:'#16e0a3',watch:'#ffb020',off:'#ff4d5e'}[v.rating]||'#7d8b9a';const rl=RLBL[v.rating]||v.rating;
+  return '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:baseline"><div><div class="lbl"><span class="dot d-'+v.status+'"></span>'+v.name+'</div><div class="v" style="font-size:32px">'+v.latest+' <small style="font-size:14px">'+v.unit+'</small></div></div><div style="text-align:right">'+spark(v.trend,stColor(v.status),150,36)+'<div class="muted small">30-day</div></div></div>'+refbar(v.low,v.high,v.latest)+'<div style="margin-top:8px;background:'+rc+'12;border:1px solid '+rc+'33;border-radius:9px;padding:8px"><span class="badge" style="background:'+rc+'2e;color:'+rc+';font-size:13px;font-weight:800;padding:3px 12px">'+rl+'</span> <span class="small">'+v.plain+'</span></div><div class="muted small" style="margin-top:6px">your range '+v.low+'–'+v.high+' '+v.unit+' · z '+(v.z>0?'+':'')+v.z+(v.cv!=null?' · var '+v.cv+'%':'')+'</div></div>';}).join('');}
 
 /* ---------- SLEEP ---------- */
 async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/sleepmed'),api('/api/sleep'),api('/api/circadian')]);
@@ -2500,8 +2515,8 @@ async function loadSleep(){const[sm,sr,cir]=await Promise.all([api('/api/health/
   $('#sJet').innerHTML='<div class="big">'+fmt(cir.social_jetlag_h)+'<small style="font-size:18px" class="muted">h</small></div><div class="lbl">weekend shift</div><div class="muted small" style="margin-top:5px">difference in your sleep timing on weekends vs weekdays. Under 1h is good.</div>';
   const srItems=[['Sleep duration',pl.duration],['Sleep regularity',pl.regularity],['Sleep debt',pl.debt]];
   if(sm.breathing&&(sm.breathing.risk!=='ok'||sm.spo2!=null))srItems.push(['Breathing / blood oxygen',{risk:sm.breathing.risk,danger:sm.breathing.note,why:sm.breathing.why,causes:sm.breathing.causes}]);
-  $('#sRisk').innerHTML='<div class="grid g2">'+srItems.map(([name,p])=>{if(!p)return'';const rk=RISKMAP[p.risk||'ok']||RISKMAP.ok;
-   return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;justify-content:space-between;align-items:center"><b>'+name+'</b><span class="badge" style="background:'+rk[0]+'22;color:'+rk[0]+'">'+rk[1]+'</span></div>'+(p.danger?'<div class="small" style="margin-top:6px">'+p.danger+'</div>':'')+(p.why?'<div class="muted small" style="margin-top:5px"><b>Why it matters:</b> '+p.why+'</div>':'')+(p.causes?'<div class="muted small" style="margin-top:3px"><b>Common causes:</b> '+p.causes+'</div>':'')+'</div>';}).join('')+'</div><div class="muted small" style="margin-top:8px">Plain-language read of your data — not a medical diagnosis.</div>';
+  $('#sRisk').innerHTML='<div class="grid g2">'+srItems.map(([name,p])=>{if(!p)return'';
+   return '<div class="panel" style="background:var(--panel2);padding:14px"><b>'+name+'</b>'+riskBox({risk:p.risk||'ok',risk_note:p.danger,why:p.why,causes:p.causes})+'</div>';}).join('')+'</div><div class="muted small" style="margin-top:8px">Plain-language read of your data — not a medical diagnosis.</div>';
   const stHex={optimal:'#16e0a3',watch:'#ffb020',flag:'#ff4d5e'};const a=sm.architecture;mkChart('sArch','bar',{labels:a.map(x=>x.stage),datasets:[{label:'You %',data:a.map(x=>x.pct),backgroundColor:a.map(x=>stHex[x.status]||'#7d8b9a')},{label:'Norm mid',data:a.map(x=>({Light:50,Deep:15,REM:22}[x.stage])),type:'line',borderColor:'#8b97a4',borderDash:[5,4],pointRadius:0}]},{scales:{y:{min:0,max:70}}});
   $('#sArchNote').innerHTML='<div class="muted small" style="margin-bottom:4px">How your night splits into sleep stages vs the clinical healthy range. Deep = physical recovery, REM = mental recovery.</div>'+a.map(x=>'<div class="small"><span class="dot d-'+x.status+'"></span><b>'+x.stage+'</b> '+x.pct+'% <span class="muted">(healthy '+x.norm+') — '+x.plain+'</span></div>').join('');
   mkChart('sStage','doughnut',{labels:['Light','REM','Deep'],datasets:[{data:[a.find(x=>x.stage=='Light').pct,a.find(x=>x.stage=='REM').pct,a.find(x=>x.stage=='Deep').pct],backgroundColor:['#38bdf8','#a78bfa','#00e5a0']}]},{plugins:{legend:{position:'bottom'}}});
