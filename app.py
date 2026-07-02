@@ -168,6 +168,12 @@ SCHEMA = [
 def init_db():
     for stmt in SCHEMA:
         run(stmt)
+    # migrations: add age/sex to existing users tables (ignore if already present)
+    for col, typ in (("age", "INTEGER"), ("sex", "TEXT")):
+        try:
+            run(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
 
 # ============================================================ USERS / SESSION
 def upsert_user(profile):
@@ -1456,6 +1462,61 @@ def peptide_correlations(uid):
                           "confounders exist, and small samples are noisy. Not medical advice."}
 
 
+# ============================================================ POPULATION NORMS
+# Study-based reference values. HRV rMSSD medians decline with age; women lower &
+# resting HR higher than men. Sources: population HRV/RHR studies, NSF sleep guidance.
+HRV_NORM = {(18, 25): (75, 60), (25, 35): (62, 50), (35, 45): (48, 40),
+            (45, 55): (38, 32), (55, 65): (30, 26), (65, 120): (24, 22)}  # (male, female) ms
+
+
+def _age_band(age):
+    for lo, hi in ((18, 25), (25, 35), (35, 45), (45, 55), (55, 65), (65, 120)):
+        if lo <= age < hi:
+            return (lo, hi)
+    return (25, 35)
+
+
+def norm_values(age, sex):
+    fem = (sex or "male").lower().startswith("f")
+    hrv = HRV_NORM.get(_age_band(age or 30), (50, 42))[1 if fem else 0]
+    return {"hrv": hrv, "rhr": 79 if fem else 74,
+            "sleep_hours": 7.5 if (age or 30) >= 65 else 8.0, "resp": 15.0, "spo2": 97.0}
+
+
+def population_compare(uid):
+    u = get_user(uid) or {}
+    age, sex = u.get("age"), u.get("sex")
+    if not age or not sex:
+        return {"have_profile": False}
+    recs, sleeps = _recs(uid)[-30:], _sleeps(uid)[-30:]
+    you = {"hrv": _mean([r["hrv_rmssd_ms"] for r in recs]), "rhr": _mean([r["resting_hr"] for r in recs]),
+           "sleep_hours": _mean([s["hours"] for s in sleeps]), "resp": _mean([s["respiratory_rate"] for s in sleeps]),
+           "spo2": _mean([r["spo2_pct"] for r in recs])}
+    nv = norm_values(age, sex)
+    META = {
+        "hrv": ("HRV", "ms", True, "how recovered your nervous system is — higher means better recovery"),
+        "rhr": ("Resting heart rate", "bpm", False, "how hard your heart works at rest — lower is fitter"),
+        "sleep_hours": ("Sleep duration", "h", True, "hours slept per night — 7–9h is the healthy target"),
+        "resp": ("Breathing rate", "/min", False, "breaths per minute while asleep — steady and low is good"),
+        "spo2": ("Blood oxygen", "%", True, "oxygen in your blood — 95–100% is normal"),
+    }
+    sexword = "women" if sex.lower().startswith("f") else "men"
+    rows = []
+    for k, (label, unit, hb, explain) in META.items():
+        yv, avg = you[k], nv[k]
+        if yv is None:
+            continue
+        better = (yv > avg) if hb else (yv < avg)
+        pct = round((yv - avg) / avg * 100) if avg else 0
+        status = "typical" if abs(pct) < 6 else ("better" if better else "below")
+        word = {"better": "better than average 👍", "below": "below average", "typical": "about average"}[status]
+        plain = f"Your {label} of {round(yv,1)} {unit} is {word} for {sexword} aged {age} (average is ~{avg} {unit})."
+        rows.append({"metric": label, "unit": unit, "you": _round(yv), "avg": avg, "status": status,
+                     "higher_better": hb, "explain": explain, "plain": plain})
+    return {"have_profile": True, "age": age, "sex": sex, "rows": rows,
+            "note": "Compared to published population averages for your age & sex. General reference, not a diagnosis."}
+
+
 # ============================================================ WEB APP
 app = FastAPI(title="WHOOP Circle")
 
@@ -1512,7 +1573,8 @@ def api_me(request: Request):
         return {"signed_in": False, "has_credentials": not missing_credentials()}
     u = get_user(uid)
     return {"signed_in": True, "user_id": uid, "name": u["display_name"] if u else "You",
-            "first_name": u["first_name"] if u else "", "connected": token_row(uid) is not None}
+            "first_name": u["first_name"] if u else "", "connected": token_row(uid) is not None,
+            "age": (u or {}).get("age"), "sex": (u or {}).get("sex")}
 
 
 @app.post("/api/profile")
@@ -1521,7 +1583,19 @@ async def api_profile(request: Request):
     name = (body.get("display_name") or "").strip()
     if name:
         run("UPDATE users SET display_name=? WHERE user_id=?", (name, uid))
+    if body.get("age") not in (None, ""):
+        try:
+            run("UPDATE users SET age=? WHERE user_id=?", (int(body["age"]), uid))
+        except (ValueError, TypeError):
+            pass
+    if body.get("sex"):
+        run("UPDATE users SET sex=? WHERE user_id=?", (body["sex"], uid))
     return {"ok": True}
+
+
+@app.get("/api/health/population")
+def api_population(request: Request):
+    return population_compare(require(request))
 
 
 @app.post("/api/sync/recent")
@@ -1549,7 +1623,7 @@ def api_dashboard(request: Request):
             "vitals": vitals_panel(uid)["vitals"], "load": load_acwr(uid),
             "sleep": sleep_medicine(uid), "overview": overview(uid),
             "narrative": weekly_narrative(uid)["narrative"],
-            "recovery_series": rc["series"][-30:]}
+            "recovery_series": rc["series"][-30:], "population": population_compare(uid)}
 
 
 @app.get("/api/sleep")
@@ -1966,17 +2040,18 @@ a{color:var(--accent2)}
 <section id="tab-dashboard">
 <div class="grid g4">
 <div class="panel" style="grid-row:span 2;display:flex;flex-direction:column;align-items:center;justify-content:center"><h3 style="align-self:flex-start">Readiness</h3><div id="dRing"></div><div id="dRec" class="small muted" style="text-align:center;margin-top:8px"></div></div>
-<div class="panel span3"><h3>Early-warning</h3><div id="dEw"></div></div>
+<div class="panel span3"><h3>Early-warning</h3><div class="muted small" style="margin:-6px 0 8px">Watches for early signs of illness or overtraining — before you feel them.</div><div id="dEw"></div></div>
 <div class="panel"><h3>Load</h3><div id="dLoad"></div></div>
 <div class="panel"><h3>Sleep</h3><div id="dSleep"></div></div>
 <div class="panel"><h3>Latest</h3><div id="dLatest"></div></div>
 </div>
-<div class="panel" style="margin-top:15px"><h3>Vitals snapshot</h3><div class="grid cards" id="dVitals"></div></div>
+<div class="panel" style="margin-top:15px"><h3>Vitals snapshot</h3><div class="muted small" style="margin:-6px 0 10px">Your key body signals vs <i>your own</i> normal. Green dot = healthy · amber = keep an eye · red = off.</div><div class="grid cards" id="dVitals"></div></div>
 <div class="grid g2" style="margin-top:15px">
-<div class="panel"><h3>Recovery &amp; strain — last 30</h3><div class="ch"><canvas id="dChart"></canvas></div></div>
+<div class="panel"><h3>Recovery &amp; strain — last 30</h3><div class="muted small" style="margin:-6px 0 6px">Green = how recovered you are · Orange = how hard you pushed that day.</div><div class="ch"><canvas id="dChart"></canvas></div></div>
 <div class="panel"><h3>Your weekly read-out</h3><div id="dNarr" class="reveal" style="font-size:15px;line-height:1.7"></div>
 <div id="dStreaks" style="margin-top:12px"></div></div>
 </div>
+<div class="panel" style="margin-top:15px"><h3>How you compare to people your age &amp; sex</h3><div id="dCompare"></div></div>
 </section>
 
 <section id="tab-vitals" class="hidden">
@@ -2089,6 +2164,8 @@ a{color:var(--accent2)}
 <section id="tab-settings" class="hidden">
 <div class="panel"><h3>Display name</h3><p class="muted small">What friends see inside your circles.</p>
 <div class="row"><div><input id="setName"></div><div style="flex:0"><button class="b p" onclick="saveName()">Save</button></div></div><span class="muted small" id="setMsg"></span></div>
+<div class="panel"><h3>Age &amp; sex</h3><p class="muted small">Used to compare your stats against the average person your age &amp; sex (WHOOP doesn't share this). Private to you.</p>
+<div class="row"><div><label>Age</label><input id="setAge" type="number" min="13" max="100" placeholder="e.g. 28"></div><div><label>Sex</label><select id="setSex"><option value="">—</option><option value="male">Male</option><option value="female">Female</option></select></div><div style="flex:0;display:flex;align-items:flex-end"><button class="b p" onclick="saveProfile()">Save</button></div></div><span class="muted small" id="setMsg2"></span></div>
 <div class="panel"><h3>About the analytics</h3><p class="muted small">Everything is computed against your own rolling baseline using personal z-scores, EWMA training load (ACWR), and published clinical/sports-science thresholds. Informational only — not medical advice.</p></div>
 <div class="panel"><h3>Account</h3><button class="b red" onclick="signOut()">Sign out</button></div>
 </section>
@@ -2181,7 +2258,15 @@ async function loadDashboard(){
  $('#dVitals').innerHTML=d.vitals.map(vitTile).join('');
  const s=d.recovery_series,labels=s.map(p=>p.day);
  mkChart('dChart','line',{labels,datasets:[{label:'Recovery %',data:s.map(p=>p.recovery),borderColor:'#16e0a3',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Strain',data:s.map(p=>p.strain),borderColor:'#ff8a3a',tension:.3,pointRadius:0,yAxisID:'y1'}]},{scales:{y:{position:'left',min:0,max:100},y1:{position:'right',min:0,max:21,grid:{drawOnChartArea:false}}}});
- $('#dNarr').innerHTML=d.narrative;}
+ $('#dNarr').innerHTML=d.narrative;
+ $('#dCompare').innerHTML=compareHtml(d.population);}
+function compareHtml(pop){if(!pop||!pop.have_profile)return '<span class="muted small">Set your <b>age &amp; sex</b> in Settings to see how you stack up against the average person your age.</span>';
+ return '<div class="muted small" style="margin-bottom:10px">'+pop.note+'</div><div class="grid g2">'+pop.rows.map(r=>{const col=r.status==='better'?'#16e0a3':r.status==='below'?'#ff4d5e':'#ffb020';const mx=(Math.max(r.you,r.avg)*1.3)||1;
+  return '<div class="panel" style="background:var(--panel2);padding:14px"><div style="display:flex;justify-content:space-between;align-items:center"><b>'+r.metric+'</b><span class="badge" style="background:'+col+'22;color:'+col+'">'+r.status+'</span></div>'+
+   '<div class="small" style="margin:6px 0">'+r.plain+'</div>'+
+   '<div style="font-size:11px;color:var(--muted)">You — '+r.you+' '+r.unit+'</div><div class="pctbar"><div class="pctfill" style="width:'+Math.min(100,r.you/mx*100)+'%;background:'+col+'"></div></div>'+
+   '<div style="font-size:11px;color:var(--muted);margin-top:4px">Average — '+r.avg+' '+r.unit+'</div><div class="pctbar"><div class="pctfill" style="width:'+Math.min(100,r.avg/mx*100)+'%;background:#3a4654"></div></div>'+
+   '<div class="muted small" style="margin-top:6px">ℹ️ '+r.explain+'</div></div>';}).join('')+'</div>';}
 
 /* ---------- VITALS ---------- */
 async function loadVitals(){const[vp,ew]=await Promise.all([api('/api/health/vitals'),api('/api/health/early-warning')]);
@@ -2318,7 +2403,8 @@ async function leaveCircle(cid,owner){if(!confirm(owner?'Delete this circle for 
 function copyCode(c){navigator.clipboard&&navigator.clipboard.writeText(c);}
 
 /* ---------- SETTINGS ---------- */
-function loadSettings(){$('#setName').value=me?me.name:'';}
+function loadSettings(){$('#setName').value=me?me.name:'';if(me){$('#setAge').value=me.age||'';$('#setSex').value=me.sex||'';}}
+async function saveProfile(){const age=$('#setAge').value,sex=$('#setSex').value;await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({age:age?+age:null,sex})});if(me){me.age=age?+age:null;me.sex=sex;}$('#setMsg2').textContent='Saved ✓ — check your Dashboard';setTimeout(()=>$('#setMsg2').textContent='',2500);}
 async function saveName(){const n=$('#setName').value.trim();if(!n)return;await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_name:n})});me.name=n;$('#sideName').textContent=n;$('#setMsg').textContent='Saved ✓';setTimeout(()=>$('#setMsg').textContent='',1500);}
 
 function mkChart(id,type,data,opts){opts=opts||{};const el=$('#'+id);if(!el)return;if(charts[id])charts[id].destroy();
