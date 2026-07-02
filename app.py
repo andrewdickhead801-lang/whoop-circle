@@ -162,6 +162,7 @@ SCHEMA = [
         records INTEGER, ok INTEGER, message TEXT)""",
     """CREATE TABLE IF NOT EXISTS goals(user_id BIGINT, metric TEXT, target REAL, direction TEXT,
         created_at REAL, PRIMARY KEY(user_id, metric))""",
+    """CREATE TABLE IF NOT EXISTS assets(name TEXT PRIMARY KEY, data TEXT, ctype TEXT, created_at REAL)""",
 ]
 
 
@@ -1796,6 +1797,38 @@ async def api_profile(request: Request):
 @app.get("/api/health/population")
 def api_population(request: Request):
     return population_compare(require(request))
+
+
+# ---- Asset hosting (organ illustrations stored in DB, served as images) ----
+ASSET_UPLOAD_TOKEN = "wc-organ-upload-7g2k"
+
+
+@app.post("/api/asset/{name}")
+async def api_asset_put(name: str, request: Request):
+    if request.query_params.get("token") != ASSET_UPLOAD_TOKEN:
+        raise HTTPException(403, "bad token")
+    body = await request.json()
+    data = (body.get("data") or "").split(",")[-1]  # strip data: prefix if present
+    if not data:
+        raise HTTPException(400, "no data")
+    upsert("assets", {"name": name, "data": data,
+                      "ctype": body.get("ctype", "image/jpeg"), "created_at": time.time()},
+           ["name"])
+    return {"ok": True, "name": name, "bytes": len(data)}
+
+
+@app.get("/asset/{name}")
+def api_asset_get(name: str):
+    import base64 as _b64
+    row = one("SELECT data, ctype FROM assets WHERE name=?", (name,))
+    if not row:
+        raise HTTPException(404, "not found")
+    try:
+        raw = _b64.b64decode(row["data"])
+    except Exception:
+        raise HTTPException(500, "decode error")
+    return Response(content=raw, media_type=row["ctype"] or "image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.post("/api/sync/recent")
